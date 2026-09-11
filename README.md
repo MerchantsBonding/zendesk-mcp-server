@@ -15,75 +15,96 @@ This MCP server enables the following Zendesk operations:
 ## Prerequisites
 
 - Ruby (tested with Ruby 2.7+)
-- A Zendesk account with admin access, to register an OAuth client
-- Zendesk OAuth credentials (client ID and client secret)
+- A Zendesk admin to register one OAuth client, once, for the whole team
+- Each developer authorizes their own machine, in their browser, once
 
 ## Authentication
 
-This server authenticates with **OAuth**, using the client credentials grant.
-API token authentication is no longer supported. Zendesk makes OAuth mandatory
-for all customers on **1 April 2027**.
+This server uses **OAuth**, with the authorization code grant and PKCE. API
+token authentication is not supported. Zendesk makes OAuth mandatory for all
+customers on **1 April 2027**.
 
-The server gets its own access token and keeps it in a cache file. It requests
-the maximum lifetime that Zendesk allows, which is 48 hours, and gets a new
-token when the old one runs out. No manual step is needed after setup.
+Each developer authorizes their own machine and acts as themselves. Tickets
+created or updated through this server are attributed to the developer who did
+it, with that developer's own Zendesk permissions.
+
+There is **no client secret**. The OAuth client is registered as public, so
+PKCE takes the place of a secret. Nothing confidential is distributed to the
+team, and nothing confidential sits in your environment variables.
 
 | Item | Value |
 |---|---|
-| Cache file | `~/.cache/zendesk-mcp-server/token.json` (or `$XDG_CACHE_HOME`) |
+| Token file | `~/.cache/zendesk-mcp-server/token.json` (or `$XDG_CACHE_HOME`) |
 | File permissions | `0600`, owner only |
-| Token lifetime | 48 hours, the Zendesk maximum |
+| Access token lifetime | 48 hours, the Zendesk maximum |
+| Refresh token lifetime | 90 days, the Zendesk maximum |
 
-The cache records the domain and client ID that produced the token. If you
-change either one, the server discards the cached token automatically. To force
-a new token at any time, delete the cache file.
+After the one-time authorization, the server renews its own access token. You
+authorize again only if you do not use the server for 90 days, or if an admin
+revokes the token.
+
+The token file records the domain and client ID that produced it. Change
+either one and the server asks you to authorize again, rather than failing in a
+confusing way.
 
 ## Setup
 
-### 1. Register an OAuth client
+### 1. Register the OAuth client (admin, once per team)
 
-1. Log into your Zendesk Admin Center
+1. Log into Zendesk Admin Center
 2. Go to Apps and integrations > APIs > Zendesk API
 3. Open the **OAuth Clients** tab and click **Add OAuth client**
-4. Give the client a name and a unique identifier
-5. Set the client type to **Confidential**
-6. Save, then copy the **secret**. Zendesk shows the secret one time only.
+4. Set **Client kind** to **Public**. This is what makes PKCE apply and removes
+   the need for a secret.
+5. Set **Redirect URLs** to:
 
-The unique identifier is your `ZENDESK_CLIENT_ID`. The secret is your
-`ZENDESK_CLIENT_SECRET`.
+   ```
+   http://localhost:4567/callback
+   ```
 
-The client credentials grant acts as the Zendesk user who owns the OAuth
-client. Tickets that this server creates or updates are attributed to that
-user.
+6. Under **Allowed scopes**, permit `read` and `write`
+7. Save, and share the **unique identifier** with the team. It is not secret.
 
 ### 2. Environment Variables
 
-Add the following environment variables to your shell configuration file (e.g., `~/.bashrc`, `~/.zshrc`, or `~/.bash_profile`):
+Add the following to your shell configuration file (e.g., `~/.bashrc`, `~/.zshrc`, or `~/.bash_profile`):
 
 ```bash
 export ZENDESK_DOMAIN="your-subdomain.zendesk.com"
-export ZENDESK_CLIENT_ID="your-oauth-client-identifier"
-export ZENDESK_CLIENT_SECRET="your-oauth-client-secret"
+export ZENDESK_CLIENT_ID="the-oauth-client-unique-identifier"
 ```
 
-`ZENDESK_DOMAIN`, `ZENDESK_CLIENT_ID` and `ZENDESK_CLIENT_SECRET` are required.
-The server refuses to start if any one of them is missing.
+Both are required. There is no secret to set.
 
-Optionally, restrict what the server can do:
+Two optional variables:
 
 ```bash
-export ZENDESK_OAUTH_SCOPES="read write"   # this is the default
+export ZENDESK_OAUTH_SCOPES="read write"                        # default
+export ZENDESK_OAUTH_REDIRECT_URI="http://localhost:4567/callback"  # default
 ```
 
-The five tools read and write tickets and read users, so `read write` covers
-them all. Narrow this if you only need a subset.
+`ZENDESK_OAUTH_REDIRECT_URI` must match a redirect URL registered on the OAuth
+client. Change it only if port 4567 is taken, and register the new URL first.
 
-After adding these variables, reload your shell configuration:
+Reload your shell configuration:
 ```bash
 source ~/.bashrc  # or ~/.zshrc, ~/.bash_profile depending on your shell
 ```
 
-### 3. MCP Configuration
+### 3. Authorize your machine (each developer, once)
+
+```bash
+ruby zendesk_mcp_server.rb --authorize
+```
+
+This opens your browser at Zendesk, where you approve access. The command
+prints the link as well, in case no browser opens. After you approve, the
+tokens are written to the token file and the command exits.
+
+Run this once per machine. Run it again if the server reports that
+authorization is needed.
+
+### 4. MCP Configuration
 
 Configure the MCP server in your `.mcp.json` file. This file tells AI assistants how to connect to this server.
 
@@ -144,26 +165,41 @@ The server also provides these read-only resources:
 
 ## Troubleshooting
 
-1. **`Missing required environment variables`**: The server did not start. Set `ZENDESK_DOMAIN`, `ZENDESK_CLIENT_ID` and `ZENDESK_CLIENT_SECRET`.
-2. **`OAuth token request failed: HTTP 401`**: Zendesk rejected the client ID or secret. Confirm both values, and confirm the OAuth client is **Confidential**.
-3. **`HTTP 403`** on a tool call: The token is valid but the scope is too narrow. Check `ZENDESK_OAUTH_SCOPES`.
-4. **Authentication worked before and now fails**: Delete `~/.cache/zendesk-mcp-server/token.json` and try again. The server mints a new token.
-5. **Connection errors**: Verify your ZENDESK_DOMAIN is correct (should be your-subdomain.zendesk.com)
-6. **Missing dependencies**: This server uses only Ruby standard library, no gems required
+1. **`Run: ruby zendesk_mcp_server.rb --authorize`**: This machine holds no
+   usable tokens. Run that command. You see this on a new machine, after 90
+   days of not using the server, or after an admin revoked the token.
+2. **`Missing required environment variables`**: Set `ZENDESK_DOMAIN` and
+   `ZENDESK_CLIENT_ID`.
+3. **The browser shows an invalid redirect URL**: The redirect URL registered
+   on the OAuth client does not match `ZENDESK_OAUTH_REDIRECT_URI`. They must
+   be identical, including the port and the path.
+4. **`Port 4567 is already in use`**: Something else holds the port. Close it,
+   or register a different redirect URL and set `ZENDESK_OAUTH_REDIRECT_URI`.
+5. **`HTTP 403`** on a tool call: Your Zendesk user lacks permission for that
+   action, or `ZENDESK_OAUTH_SCOPES` is too narrow.
+6. **Authorization keeps being requested**: Check that the token file is
+   writable, at `~/.cache/zendesk-mcp-server/token.json`.
+7. **Connection errors**: Verify your ZENDESK_DOMAIN is correct (should be your-subdomain.zendesk.com)
+8. **Missing dependencies**: This server uses only Ruby standard library, no gems required
 
 ## Testing
 
 ```bash
-ruby test/test_zendesk_oauth.rb
+ruby test/all.rb            # everything
+ruby test/test_zendesk_oauth.rb   # one file
 ```
 
 The tests use minitest, which ships with Ruby. No test reaches the network.
 
 ## Security
 
-- Store your OAuth credentials securely as environment variables
-- Never commit credentials to version control
-- Narrow `ZENDESK_OAUTH_SCOPES` to the least privilege your work needs
-- The cached token is written with `0600` permissions, readable by you only
-- To revoke access, delete the OAuth client in Zendesk Admin Center. This
-  invalidates every token it issued.
+- There is no client secret to leak, store, or rotate. PKCE replaces it.
+- The client ID is not secret. Sharing it with the team is expected.
+- Tokens are per developer. They live only in that developer's token file,
+  written with `0600` permissions.
+- Every action is attributed to the developer who took it, so the Zendesk
+  audit trail stays meaningful.
+- Narrow `ZENDESK_OAUTH_SCOPES` to the least privilege your work needs.
+- To revoke one developer, delete their token in Zendesk Admin Center under
+  the OAuth client. Other developers are unaffected.
+- Never commit the token file to version control.

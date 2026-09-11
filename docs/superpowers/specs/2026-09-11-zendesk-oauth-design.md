@@ -1,5 +1,10 @@
 # Migrate Zendesk authentication from API tokens to OAuth
 
+> **Superseded on 2026-09-11** by
+> [per-developer identity](2026-09-11-zendesk-oauth-per-developer-identity.md).
+> The client credentials grant described here was implemented, then replaced,
+> because it attributes every action to one service account.
+
 Date: 2026-09-11
 Status: Approved
 

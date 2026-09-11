@@ -14,8 +14,15 @@ Run the server (it waits on STDIN for JSON-RPC lines):
 ```bash
 ZENDESK_DOMAIN=your-subdomain.zendesk.com \
 ZENDESK_CLIENT_ID=xxx \
-ZENDESK_CLIENT_SECRET=yyy \
 ruby zendesk_mcp_server.rb
+```
+
+There is no client secret. The OAuth client is public and PKCE replaces it.
+
+Authorize a machine (interactive, opens a browser, writes the token file):
+
+```bash
+ZENDESK_DOMAIN=... ZENDESK_CLIENT_ID=... ruby zendesk_mcp_server.rb --authorize
 ```
 
 Smoke-test a single request without an MCP client:
@@ -31,7 +38,8 @@ Zendesk API, because `validate_configuration!` runs in the constructor.
 Run the tests (minitest, ships with Ruby, no network access):
 
 ```bash
-ruby test/test_zendesk_oauth.rb
+ruby test/all.rb                   # everything
+ruby test/test_zendesk_oauth.rb    # one file
 ```
 
 Syntax check: `ruby -c zendesk_mcp_server.rb`
@@ -47,9 +55,19 @@ outside stdlib is required.
 response object per line to STDOUT. Anything else printed to STDOUT corrupts the protocol
 stream and breaks the client. All diagnostics go through `@logger`, which writes to STDERR.
 
-**Three classes in one file.** `ZendeskHttp` holds the shared TLS setup, `ZendeskOAuth`
-supplies access tokens, and `ZendeskMCPServer` speaks the protocol. The file stays a single
-script because MCP client configuration points at one path.
+**Entry point plus `lib/`.** `zendesk_mcp_server.rb` holds the protocol server and the CLI
+entry point. The auth machinery lives beside it:
+
+| File | Responsibility |
+|---|---|
+| `lib/zendesk_http.rb` | Shared TLS setup, including the CRL workaround |
+| `lib/zendesk_pkce.rb` | PKCE verifier and S256 challenge |
+| `lib/zendesk_token_store.rb` | Reads, writes and **locks** the token file |
+| `lib/zendesk_oauth.rb` | Supplies access tokens, refreshes them |
+| `lib/zendesk_authorizer.rb` | The one-time `--authorize` browser flow |
+
+Each has one job, so the locking and the refresh rules can be tested without a network or
+a browser.
 
 **Three layers inside the server class:**
 
@@ -77,37 +95,53 @@ change the resources too.
 
 ## Authentication
 
-OAuth only, using the **client credentials** grant. API token auth was removed. Zendesk
-makes OAuth mandatory for all customers on 1 April 2027.
+OAuth with the **authorization code grant and PKCE**, against a **public** OAuth client.
+There is no client secret anywhere in this project. Zendesk makes OAuth mandatory for all
+customers on 1 April 2027.
 
-Why this grant and not authorization code:
+Each developer authorizes their own machine, so every API call carries that developer's
+identity and permissions. This replaced an earlier client credentials implementation, which
+worked but attributed every action to one service account.
 
-- Zendesk applies a 30-minute access token expiry by default to clients created on or after
-  30 April 2026, so a static token does not work.
-- Refresh tokens are single-use and rotated. This server can run as several concurrent
-  processes, one per MCP client session, which would race to burn the same refresh token.
-  The client credentials grant issues no refresh token, so there is nothing to rotate.
+**`--authorize` flow** (`ZendeskAuthorizer`): generate a PKCE verifier and S256 challenge,
+open the consent page, listen on `http://localhost:4567/callback` for exactly one request,
+check the `state`, then exchange the code plus the verifier for tokens.
 
-`ZendeskOAuth` caches the token at `~/.cache/zendesk-mcp-server/token.json` with mode
-`0600`, and stores the `domain` and `client_id` alongside it. A cache entry is only usable
-when both still match, so changing instance or rotating the client invalidates it with no
-manual step. No file locking is used, and none is needed: nothing is rotated, so a lost
-write costs one extra mint.
+The redirect URL must be **pre-registered** on the OAuth client, so the port is fixed rather
+than chosen at run time. `ZENDESK_OAUTH_REDIRECT_URI` overrides it, but a matching URL must
+be registered first.
 
-Minting is deliberately **lazy**, on the first API call. The MCP client starts this server
-on every session, so minting in the constructor would stop the server from starting whenever
-Zendesk is unreachable.
+**Runtime** (`ZendeskOAuth`): never prompts. It refreshes with the stored refresh token, and
+raises `AuthorizationRequired` naming the `--authorize` command when it cannot. Both
+lifetimes are requested at the Zendesk maximum, 48 hours and 90 days, instead of the
+defaults of 30 minutes and 30 days.
 
-`expires_in` is set to 172800 seconds, the documented 48-hour maximum, to keep traffic to
-the token endpoint low.
+### Two things that will bite if changed carelessly
+
+**Refresh tokens are single-use and rotated.** An MCP client starts one server process per
+session, so several can run at once. `ZendeskOAuth#access_token` therefore takes an
+exclusive `flock` and then **re-reads the token file inside the lock**. Without that second
+read, two processes spend the same refresh token and the loser is left holding one Zendesk
+has already retired. `test_a_refresh_by_another_process_is_adopted_instead_of_repeated`
+covers this; do not delete it.
+
+**`invalidate!` must keep the refresh token.** It expires only the access token. Clearing
+both on a 401 would force the developer through the browser flow again for what is usually
+a revoked or stale access token.
 
 ## Zendesk specifics
 
-- `zendesk_request` retries **once** on HTTP 401, after invalidating the cached token.
+- `zendesk_request` retries **once** on HTTP 401, after invalidating the access token.
   Zendesk can revoke a token before it expires, so an expiry check alone is not enough. A
   keyword guard stops the retry from looping.
 - `ZendeskHttp.client` sets a custom `verify_callback` that tolerates OpenSSL errors 3 and 4
   (CRL missing / CRL not yet valid) while leaving full certificate verification on. This
   works around SSL failures seen across Ruby versions; do not replace it with
-  `VERIFY_NONE`. The token request uses this same helper, and breaks without it.
+  `VERIFY_NONE`. The token requests use this same helper, and break without it.
+- The authorization endpoint is `/oauth/authorizations/new`. Zendesk's own docs disagree
+  here, with one page giving `/oauth/authorize`. If the consent page 404s, try that instead:
+  it is the `AUTHORIZE_PATH` constant.
+- Scope values are percent-encoded with `%20` rather than `+`. Both are valid form encoding,
+  but not every OAuth endpoint accepts `+`.
+- `CGI.parse` does not exist in Ruby 4.0. Use `URI.decode_www_form`.
 - The advertised MCP `protocolVersion` is pinned to `"2024-11-05"` in `handle_initialize`.
