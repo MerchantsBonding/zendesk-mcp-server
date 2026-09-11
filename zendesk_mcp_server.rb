@@ -3,20 +3,172 @@
 require 'json'
 require 'net/http'
 require 'uri'
-require 'base64'
 require 'logger'
 require 'openssl'
+require 'fileutils'
+
+# Shared HTTPS setup for every call to Zendesk, including the token endpoint.
+module ZendeskHttp
+  module_function
+
+  def client(uri)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true
+    http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+    # Skip CRL verification errors (codes 3, 4) while keeping cert validation
+    http.verify_callback = ->(preverify_ok, store_ctx) {
+      next true if [3, 4].include?(store_ctx.error)
+      preverify_ok
+    }
+    http
+  end
+end
+
+# Supplies a Zendesk OAuth access token using the client credentials grant.
+#
+# Zendesk expires access tokens, so the token is cached on disk together with
+# its absolute expiry and re-minted when it runs out. This grant returns no
+# refresh token, so nothing is rotated and concurrent server processes cannot
+# invalidate each other. A lost cache write costs one extra mint, no more.
+class ZendeskOAuth
+  TOKEN_PATH = "/oauth/tokens"
+  # Zendesk caps expires_in at 48 hours. Ask for the maximum, because the
+  # default for clients created since 2026-04-30 is only 30 minutes.
+  MAX_EXPIRES_IN = 172_800
+  # Retire a token early, to absorb clock skew between this host and Zendesk.
+  EXPIRY_SKEW_SECONDS = 60
+  DEFAULT_SCOPES = "read write"
+
+  def self.default_cache_path
+    base = ENV["XDG_CACHE_HOME"]
+    base = File.join(Dir.home, ".cache") if base.nil? || base.empty?
+    File.join(base, "zendesk-mcp-server", "token.json")
+  end
+
+  def initialize(domain:, client_id:, client_secret:, scopes: DEFAULT_SCOPES,
+                 cache_path: default_cache_path)
+    @domain = domain
+    @client_id = client_id
+    @client_secret = client_secret
+    @scopes = scopes
+    @cache_path = cache_path
+  end
+
+  # Returns a bearer token, minting a new one when the cache misses.
+  def access_token
+    cached = read_cache
+    return cached["access_token"] if usable?(cached)
+
+    mint!
+  end
+
+  # Drops the cached token. Used when Zendesk rejects it before it expires.
+  def invalidate!
+    File.delete(@cache_path) if File.exist?(@cache_path)
+  rescue SystemCallError
+    nil
+  end
+
+  private
+
+  def default_cache_path
+    self.class.default_cache_path
+  end
+
+  def mint!
+    response = post_token_request(
+      "grant_type" => "client_credentials",
+      "client_id" => @client_id,
+      "client_secret" => @client_secret,
+      "scope" => @scopes,
+      "expires_in" => MAX_EXPIRES_IN
+    )
+
+    token = response["access_token"]
+    raise "OAuth token request returned no access_token" if token.nil? || token.empty?
+
+    expires_in = response["expires_in"].to_i
+    expires_in = MAX_EXPIRES_IN if expires_in <= 0
+    write_cache(token, Time.now.to_i + expires_in)
+    token
+  end
+
+  def post_token_request(params)
+    uri = URI("https://#{@domain}#{TOKEN_PATH}")
+    request = Net::HTTP::Post.new(uri)
+    request["Content-Type"] = "application/json"
+    request["Accept"] = "application/json"
+    request.body = JSON.generate(params)
+
+    response = ZendeskHttp.client(uri).request(request)
+    unless response.code.to_i.between?(200, 299)
+      raise "OAuth token request failed: HTTP #{response.code}: #{response.body}"
+    end
+
+    JSON.parse(response.body)
+  end
+
+  def read_cache
+    return nil unless File.exist?(@cache_path)
+
+    JSON.parse(File.read(@cache_path))
+  rescue JSON::ParserError, SystemCallError, IOError
+    nil
+  end
+
+  # A cached token is only usable for the instance and client that minted it,
+  # so changing either one invalidates the cache with no manual step.
+  def usable?(cached)
+    return false unless cached.is_a?(Hash)
+    return false if cached["access_token"].to_s.empty?
+    return false unless cached["domain"] == @domain
+    return false unless cached["client_id"] == @client_id
+
+    cached["expires_at"].to_i - EXPIRY_SKEW_SECONDS > Time.now.to_i
+  end
+
+  def write_cache(token, expires_at)
+    FileUtils.mkdir_p(File.dirname(@cache_path), mode: 0o700)
+    File.write(@cache_path, JSON.generate(
+      "access_token" => token,
+      "expires_at" => expires_at,
+      "domain" => @domain,
+      "client_id" => @client_id
+    ))
+    File.chmod(0o600, @cache_path)
+  rescue SystemCallError => e
+    # A cache failure must not fail the request. Mint again next time.
+    warn("Could not write OAuth token cache: #{e.message}")
+  end
+end
 
 class ZendeskMCPServer
-  def initialize
+  def initialize(oauth: nil)
     @logger = Logger.new(STDERR)
     @logger.level = Logger::INFO
 
     @zendesk_domain = ENV['ZENDESK_DOMAIN']
-    @zendesk_email = ENV['ZENDESK_EMAIL']
-    @zendesk_token = ENV['ZENDESK_API_TOKEN']
+    @client_id = ENV['ZENDESK_CLIENT_ID']
+    @client_secret = ENV['ZENDESK_CLIENT_SECRET']
+
+    # An injected token supplier is used by the tests, and skips configuration
+    # checks that only apply to the real one.
+    if oauth
+      @oauth = oauth
+      return
+    end
 
     validate_configuration!
+
+    scopes = ENV['ZENDESK_OAUTH_SCOPES']
+    scopes = ZendeskOAuth::DEFAULT_SCOPES if scopes.nil? || scopes.empty?
+
+    @oauth = ZendeskOAuth.new(
+      domain: @zendesk_domain,
+      client_id: @client_id,
+      client_secret: @client_secret,
+      scopes: scopes
+    )
   end
 
   def run
@@ -60,13 +212,13 @@ class ZendeskMCPServer
 
   def validate_configuration!
     missing = []
-    missing << "ZENDESK_DOMAIN" unless @zendesk_domain
-    missing << "ZENDESK_EMAIL" unless @zendesk_email
-    missing << "ZENDESK_TOKEN" unless @zendesk_token
+    missing << "ZENDESK_DOMAIN" if @zendesk_domain.to_s.empty?
+    missing << "ZENDESK_CLIENT_ID" if @client_id.to_s.empty?
+    missing << "ZENDESK_CLIENT_SECRET" if @client_secret.to_s.empty?
 
-    if missing.any?
-      raise "Missing required environment variables: #{missing.join(', ')}"
-    end
+    return if missing.empty?
+
+    raise "Missing required environment variables: #{missing.join(', ')}"
   end
 
   def handle_request(request)
@@ -382,51 +534,56 @@ class ZendeskMCPServer
     zendesk_request("GET", endpoint)
   end
 
-  def zendesk_request(method, endpoint, data = nil)
+  def zendesk_request(method, endpoint, data = nil, retry_on_auth_failure: true)
     uri = URI("https://#{@zendesk_domain}#{endpoint}")
+    request = build_request(method, uri, data)
 
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = true
-    http.verify_mode = OpenSSL::SSL::VERIFY_PEER
-    # Skip CRL verification errors (codes 3, 4) while keeping cert validation
-    http.verify_callback = ->(preverify_ok, store_ctx) {
-      return true if [3, 4].include?(store_ctx.error)  # CRL errors
-      preverify_ok
-    }
-
-    case method.upcase
-    when "GET"
-      request = Net::HTTP::Get.new(uri)
-    when "POST"
-      request = Net::HTTP::Post.new(uri)
-      request.body = data.to_json if data
-    when "PUT"
-      request = Net::HTTP::Put.new(uri)
-      request.body = data.to_json if data
-    else
-      raise "Unsupported HTTP method: #{method}"
-    end
-
-    # Set authentication header
-    credentials = Base64.strict_encode64("#{@zendesk_email}/token:#{@zendesk_token}")
-    request["Authorization"] = "Basic #{credentials}"
+    request["Authorization"] = "Bearer #{@oauth.access_token}"
     request["Content-Type"] = "application/json"
     request["Accept"] = "application/json"
 
-    response = http.request(request)
+    response = perform_http(uri, request)
+    code = response.code.to_i
 
-    if response.code.to_i >= 200 && response.code.to_i < 300
-      JSON.parse(response.body)
-    else
-      {
-        error: "HTTP #{response.code}: #{response.message}",
-        body: response.body
-      }
+    return JSON.parse(response.body) if code.between?(200, 299)
+
+    # Zendesk can revoke a token before it expires, so checking the expiry is
+    # not enough. Discard the cached token and try once with a fresh one.
+    if code == 401 && retry_on_auth_failure
+      @logger.warn("Zendesk rejected the access token, minting a new one")
+      @oauth.invalidate!
+      return zendesk_request(method, endpoint, data, retry_on_auth_failure: false)
     end
+
+    {
+      error: "HTTP #{response.code}: #{response.message}",
+      body: response.body
+    }
   rescue => e
     {
       error: "Request failed: #{e.message}"
     }
+  end
+
+  def build_request(method, uri, data)
+    case method.upcase
+    when "GET"
+      Net::HTTP::Get.new(uri)
+    when "POST"
+      request = Net::HTTP::Post.new(uri)
+      request.body = data.to_json if data
+      request
+    when "PUT"
+      request = Net::HTTP::Put.new(uri)
+      request.body = data.to_json if data
+      request
+    else
+      raise "Unsupported HTTP method: #{method}"
+    end
+  end
+
+  def perform_http(uri, request)
+    ZendeskHttp.client(uri).request(request)
   end
 end
 
