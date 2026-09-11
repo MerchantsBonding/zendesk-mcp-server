@@ -19,7 +19,13 @@ class ZendeskOAuth
   MAX_REFRESH_EXPIRES_IN = 7_776_000
   # Retire a token early, to absorb clock skew between this host and Zendesk.
   EXPIRY_SKEW_SECONDS = 60
-  DEFAULT_SCOPES = "read write"
+  # Least privilege for the five tools this server exposes: they read across
+  # Zendesk, but the only thing they write is tickets. Broad "write" would also
+  # grant deleting users and organizations, which no tool here does.
+  #
+  # These must sit inside the OAuth client's Allowed scopes, or Zendesk answers
+  # the authorization request with "Invalid scope".
+  DEFAULT_SCOPES = "read tickets:write"
 
   def initialize(domain:, client_id:, scopes: DEFAULT_SCOPES, store: ZendeskTokenStore.new)
     @domain = domain

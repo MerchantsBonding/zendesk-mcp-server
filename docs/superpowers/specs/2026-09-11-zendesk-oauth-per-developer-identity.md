@@ -33,7 +33,7 @@ removes.
 |---|---|---|
 | `ZENDESK_DOMAIN` | yes | unchanged |
 | `ZENDESK_CLIENT_ID` | yes | OAuth client unique identifier, not secret |
-| `ZENDESK_OAUTH_SCOPES` | no | defaults to `read write` |
+| `ZENDESK_OAUTH_SCOPES` | no | defaults to `read tickets:write` |
 | `ZENDESK_OAUTH_REDIRECT_URI` | no | defaults to `http://localhost:4567/callback` |
 
 `ZENDESK_CLIENT_SECRET` is removed.
@@ -111,3 +111,14 @@ Zendesk documents two authorization endpoints. `/oauth/authorizations/new`
 appears in the migration guide and the refresh token guide; `/oauth/authorize`
 appears in the PKCE guide. This implementation uses the former, as the
 `AUTHORIZE_PATH` constant. If the consent page returns 404, try the other.
+
+## Amendment, 2026-09-11: default scopes
+
+The default changed from `read write` to `read tickets:write`.
+
+Zendesk rejected the first authorization attempt with `Invalid scope`, because
+a requested scope must sit inside the OAuth client's Allowed scopes list. The
+narrower pair is also the correct least privilege for this server: the five
+tools read across Zendesk, but the only resource they write is tickets. Broad
+`write` would additionally permit deleting users and organizations, which no
+tool here does.

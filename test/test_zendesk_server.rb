@@ -178,3 +178,33 @@ class TestServerConfiguration < Minitest::Test
     end
   end
 end
+
+class TestConfiguredScopes < Minitest::Test
+  def with_scopes(value)
+    saved = ENV["ZENDESK_OAUTH_SCOPES"]
+    ENV.delete("ZENDESK_OAUTH_SCOPES")
+    ENV["ZENDESK_OAUTH_SCOPES"] = value unless value.nil?
+    yield
+  ensure
+    ENV.delete("ZENDESK_OAUTH_SCOPES")
+    ENV["ZENDESK_OAUTH_SCOPES"] = saved unless saved.nil?
+  end
+
+  def test_the_default_is_used_when_the_variable_is_unset
+    with_scopes(nil) do
+      assert_equal "read tickets:write", ZendeskMCPServer.configured_scopes
+    end
+  end
+
+  def test_the_default_is_used_when_the_variable_is_empty
+    with_scopes("") do
+      assert_equal "read tickets:write", ZendeskMCPServer.configured_scopes
+    end
+  end
+
+  def test_the_variable_overrides_the_default
+    with_scopes("read") do
+      assert_equal "read", ZendeskMCPServer.configured_scopes
+    end
+  end
+end

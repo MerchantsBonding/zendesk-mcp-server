@@ -62,7 +62,9 @@ confusing way.
    http://localhost:4567/callback
    ```
 
-6. Under **Allowed scopes**, permit `read` and `write`
+6. Under **Allowed scopes**, permit `read` and `tickets:write`, or leave the
+   field empty to allow everything. A requested scope outside this list is
+   rejected with `Invalid scope`.
 7. Save, and share the **unique identifier** with the team. It is not secret.
 
 ### 2. Environment Variables
@@ -79,7 +81,7 @@ Both are required. There is no secret to set.
 Two optional variables:
 
 ```bash
-export ZENDESK_OAUTH_SCOPES="read write"                        # default
+export ZENDESK_OAUTH_SCOPES="read tickets:write"                # default
 export ZENDESK_OAUTH_REDIRECT_URI="http://localhost:4567/callback"  # default
 ```
 
@@ -175,12 +177,18 @@ The server also provides these read-only resources:
    be identical, including the port and the path.
 4. **`Port 4567 is already in use`**: Something else holds the port. Close it,
    or register a different redirect URL and set `ZENDESK_OAUTH_REDIRECT_URI`.
-5. **`HTTP 403`** on a tool call: Your Zendesk user lacks permission for that
+5. **`Invalid Authorization Request` / `Invalid scope`** in the browser: the
+   OAuth client's **Allowed scopes** does not grant everything in
+   `ZENDESK_OAUTH_SCOPES`. Widen the client's allowed scopes, clear the field
+   to allow all, or narrow the variable. The scope values themselves are
+   valid; this is a client configuration problem.
+6. **`HTTP 403`** on a tool call:
+ Your Zendesk user lacks permission for that
    action, or `ZENDESK_OAUTH_SCOPES` is too narrow.
-6. **Authorization keeps being requested**: Check that the token file is
+7. **Authorization keeps being requested**: Check that the token file is
    writable, at `~/.cache/zendesk-mcp-server/token.json`.
-7. **Connection errors**: Verify your ZENDESK_DOMAIN is correct (should be your-subdomain.zendesk.com)
-8. **Missing dependencies**: This server uses only Ruby standard library, no gems required
+8. **Connection errors**: Verify your ZENDESK_DOMAIN is correct (should be your-subdomain.zendesk.com)
+9. **Missing dependencies**: This server uses only Ruby standard library, no gems required
 
 ## Testing
 
@@ -199,7 +207,8 @@ The tests use minitest, which ships with Ruby. No test reaches the network.
   written with `0600` permissions.
 - Every action is attributed to the developer who took it, so the Zendesk
   audit trail stays meaningful.
-- Narrow `ZENDESK_OAUTH_SCOPES` to the least privilege your work needs.
+- `ZENDESK_OAUTH_SCOPES` already defaults to least privilege for these tools.
+  Narrow it further if your work needs less.
 - To revoke one developer, delete their token in Zendesk Admin Center under
   the OAuth client. Other developers are unaffected.
 - Never commit the token file to version control.

@@ -250,3 +250,41 @@ class TestConcurrentRefresh < Minitest::Test
     assert_empty oauth.calls, "must not refresh a token another process already rotated"
   end
 end
+
+class TestDefaultScopes < Minitest::Test
+  def setup
+    @dir = Dir.mktmpdir
+    @store = ZendeskTokenStore.new(path: File.join(@dir, "token.json"))
+  end
+
+  def teardown
+    FileUtils.remove_entry(@dir)
+  end
+
+  # The five tools read across Zendesk but only write tickets, so the default
+  # grants no wider write access than they need.
+  def test_the_default_grants_read_plus_ticket_writes_only
+    assert_equal "read tickets:write", ZendeskOAuth::DEFAULT_SCOPES
+  end
+
+  def test_an_oauth_client_built_without_scopes_requests_the_default
+    @store.write(
+      "access_token" => "stale",
+      "expires_at" => Time.now.to_i - 1,
+      "refresh_token" => "refresh-1",
+      "refresh_expires_at" => Time.now.to_i + 86_400,
+      "domain" => DOMAIN,
+      "client_id" => CLIENT_ID
+    )
+
+    oauth = StubOAuth.new(
+      results: [{ "access_token" => "access-2", "expires_in" => 172_800 }],
+      domain: DOMAIN,
+      client_id: CLIENT_ID,
+      store: @store
+    )
+    oauth.access_token
+
+    assert_equal "read tickets:write", oauth.calls.first["scope"]
+  end
+end
