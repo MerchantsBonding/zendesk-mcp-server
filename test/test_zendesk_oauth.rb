@@ -288,3 +288,22 @@ class TestDefaultScopes < Minitest::Test
     assert_equal "read tickets:write", oauth.calls.first["scope"]
   end
 end
+
+class TestAuthorizationRequiredReason < Minitest::Test
+  # The launcher composes its own guidance, so it needs the cause on its own,
+  # separate from the fallback instruction baked into the message.
+  def test_the_error_exposes_the_reason_without_the_command
+    error = ZendeskOAuth::AuthorizationRequired.new("The refresh token expired.")
+
+    assert_equal "The refresh token expired.", error.reason
+    assert_includes error.message, "The refresh token expired."
+    assert_includes error.message, "--authorize"
+  end
+
+  def test_an_error_without_a_reason_still_names_the_command
+    error = ZendeskOAuth::AuthorizationRequired.new
+
+    assert_nil error.reason
+    assert_includes error.message, "--authorize"
+  end
+end

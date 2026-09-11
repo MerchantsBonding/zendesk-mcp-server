@@ -43,8 +43,8 @@ end
 class StubServer < ZendeskMCPServer
   attr_reader :attempts
 
-  def initialize(oauth:, responses:)
-    super(oauth: oauth)
+  def initialize(oauth:, responses:, launcher: nil)
+    super(oauth: oauth, launcher: launcher)
     @logger.level = Logger::FATAL
     @responses = responses
     @attempts = []
@@ -206,5 +206,65 @@ class TestConfiguredScopes < Minitest::Test
     with_scopes("read") do
       assert_equal "read", ZendeskMCPServer.configured_scopes
     end
+  end
+end
+
+class FakeLauncher
+  attr_reader :reasons
+
+  def initialize(message: "launcher message")
+    @message = message
+    @reasons = []
+  end
+
+  def launch(reason)
+    @reasons << reason
+    @message
+  end
+end
+
+class TestAutomaticAuthorization < Minitest::Test
+  def setup
+    @saved = ENV["ZENDESK_DOMAIN"]
+    ENV["ZENDESK_DOMAIN"] = SERVER_DOMAIN
+  end
+
+  def teardown
+    ENV["ZENDESK_DOMAIN"] = @saved
+    ENV.delete("ZENDESK_DOMAIN") if @saved.nil?
+  end
+
+  def build(launcher)
+    error = ZendeskOAuth::AuthorizationRequired.new("The refresh token expired.")
+    StubServer.new(oauth: FakeOAuth.new(error: error), responses: [], launcher: launcher)
+  end
+
+  def test_a_missing_authorization_starts_the_flow
+    launcher = FakeLauncher.new
+    build(launcher).send(:zendesk_request, "GET", "/api/v2/tickets/1.json")
+
+    assert_equal 1, launcher.reasons.length
+  end
+
+  def test_the_launcher_receives_the_reason_not_the_baked_in_command
+    launcher = FakeLauncher.new
+    build(launcher).send(:zendesk_request, "GET", "/api/v2/tickets/1.json")
+
+    assert_equal "The refresh token expired.", launcher.reasons.first
+  end
+
+  def test_the_launchers_message_is_what_the_tool_call_reports
+    result = build(FakeLauncher.new(message: "a browser has opened")).send(
+      :zendesk_request, "GET", "/api/v2/tickets/1.json"
+    )
+
+    assert_equal "a browser has opened", result[:error]
+  end
+
+  def test_no_request_is_attempted_without_credentials
+    server = build(FakeLauncher.new)
+    server.send(:zendesk_request, "GET", "/api/v2/tickets/1.json")
+
+    assert_empty server.attempts
   end
 end

@@ -10,7 +10,19 @@ require_relative 'zendesk_token_store'
 # Tokens are obtained once by ZendeskAuthorizer. This class never prompts. When
 # it cannot renew, it raises AuthorizationRequired and names the command to run.
 class ZendeskOAuth
-  class AuthorizationRequired < StandardError; end
+  # Raised when no stored credential can be renewed. `reason` is the cause on
+  # its own, so a caller can compose its own guidance; `message` always ends
+  # with the fallback command.
+  class AuthorizationRequired < StandardError
+    COMMAND = "Run: ruby zendesk_mcp_server.rb --authorize"
+
+    attr_reader :reason
+
+    def initialize(reason = nil)
+      @reason = reason
+      super([reason, COMMAND].compact.join(" "))
+    end
+  end
 
   TOKEN_PATH = "/oauth/tokens"
   # Zendesk caps the access token at 48 hours and the refresh token at 90 days.
@@ -74,7 +86,7 @@ class ZendeskOAuth
 
   def save_token_response(response, previous_refresh_token: nil)
     access_token = response["access_token"]
-    raise AuthorizationRequired, authorize_message("The token response carried no access token.") if access_token.to_s.empty?
+    raise AuthorizationRequired, "The token response carried no access token." if access_token.to_s.empty?
 
     expires_in = positive_or(response["expires_in"], MAX_EXPIRES_IN)
     refresh_expires_in = positive_or(response["refresh_token_expires_in"], MAX_REFRESH_EXPIRES_IN)
@@ -117,10 +129,10 @@ class ZendeskOAuth
 
   def refresh!(record)
     refresh_token = record["refresh_token"] if usable?(record)
-    raise AuthorizationRequired, authorize_message if refresh_token.to_s.empty?
+    raise AuthorizationRequired if refresh_token.to_s.empty?
 
     expiry = record["refresh_expires_at"].to_i
-    raise AuthorizationRequired, authorize_message("The refresh token expired.") if expiry.positive? && expiry <= Time.now.to_i
+    raise AuthorizationRequired, "The refresh token expired." if expiry.positive? && expiry <= Time.now.to_i
 
     response = begin
       post_token_request(
@@ -132,7 +144,7 @@ class ZendeskOAuth
         "refresh_token_expires_in" => MAX_REFRESH_EXPIRES_IN
       )
     rescue StandardError => e
-      raise AuthorizationRequired, authorize_message("Zendesk refused the refresh token: #{e.message}.")
+      raise AuthorizationRequired, "Zendesk refused the refresh token: #{e.message}."
     end
 
     save_token_response(response, previous_refresh_token: refresh_token)
@@ -143,11 +155,6 @@ class ZendeskOAuth
     return fallback unless number.positive?
 
     number
-  end
-
-  def authorize_message(reason = nil)
-    prefix = reason ? "#{reason} " : ""
-    "#{prefix}Run: ruby zendesk_mcp_server.rb --authorize"
   end
 
   def post_token_request(params)

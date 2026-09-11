@@ -6,6 +6,7 @@ require 'uri'
 require 'logger'
 require_relative 'lib/zendesk_oauth'
 require_relative 'lib/zendesk_authorizer'
+require_relative 'lib/zendesk_authorization_launcher'
 require_relative 'lib/zendesk_token_store'
 require_relative 'lib/zendesk_http'
 
@@ -27,12 +28,14 @@ class ZendeskMCPServer
     uri
   end
 
-  def initialize(oauth: nil)
+  def initialize(oauth: nil, launcher: nil)
     @logger = Logger.new(STDERR)
     @logger.level = Logger::INFO
 
     @zendesk_domain = ENV['ZENDESK_DOMAIN']
     @client_id = ENV['ZENDESK_CLIENT_ID']
+
+    @launcher = launcher
 
     # An injected token supplier is used by the tests, and skips configuration
     # checks that only apply to the real one.
@@ -48,6 +51,8 @@ class ZendeskMCPServer
       client_id: @client_id,
       scopes: self.class.configured_scopes
     )
+
+    @launcher ||= ZendeskAuthorizationLauncher.new(script_path: File.expand_path(__FILE__))
   end
 
   def run
@@ -438,14 +443,22 @@ class ZendeskMCPServer
       body: response.body
     }
   rescue ZendeskOAuth::AuthorizationRequired => e
-    # Tell the developer what to run, rather than showing a failed request.
+    # Start the browser flow if we can, and tell the developer what happens
+    # next, rather than showing a failed request.
     {
-      error: e.message
+      error: authorization_message(e)
     }
   rescue => e
     {
       error: "Request failed: #{e.message}"
     }
+  end
+
+  # The launcher never blocks and never raises, so a tool call always answers.
+  def authorization_message(error)
+    return error.message if @launcher.nil?
+
+    @launcher.launch(error.reason)
   end
 
   def build_request(method, uri, data)

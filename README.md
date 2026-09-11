@@ -43,6 +43,14 @@ After the one-time authorization, the server renews its own access token. You
 authorize again only if you do not use the server for 90 days, or if an admin
 revokes the token.
 
+When that happens, the server notices and **opens your browser for you**. The
+tool call you made returns a message telling you to approve access and run the
+request again. You do not have to remember the command.
+
+This is best effort, and deliberately so. On a machine with no browser, or with
+`ZENDESK_AUTO_AUTHORIZE=0` set, the server falls back to naming the command
+instead. Only one flow starts at a time, however many sessions you have open.
+
 The token file records the domain and client ID that produced it. Change
 either one and the server asks you to authorize again, rather than failing in a
 confusing way.
@@ -83,6 +91,7 @@ Two optional variables:
 ```bash
 export ZENDESK_OAUTH_SCOPES="read tickets:write"                # default
 export ZENDESK_OAUTH_REDIRECT_URI="http://localhost:4567/callback"  # default
+export ZENDESK_AUTO_AUTHORIZE=0                                 # do not open a browser automatically
 ```
 
 `ZENDESK_OAUTH_REDIRECT_URI` must match a redirect URL registered on the OAuth
@@ -167,9 +176,11 @@ The server also provides these read-only resources:
 
 ## Troubleshooting
 
-1. **`Run: ruby zendesk_mcp_server.rb --authorize`**: This machine holds no
-   usable tokens. Run that command. You see this on a new machine, after 90
-   days of not using the server, or after an admin revoked the token.
+1. **A tool call says a browser has opened**: your stored authorization ran out
+   or was revoked. Approve access in the browser, then run the request again.
+   If no browser appeared, the link is in
+   `~/.cache/zendesk-mcp-server/authorize.log`, or run
+   `ruby zendesk_mcp_server.rb --authorize` yourself.
 2. **`Missing required environment variables`**: Set `ZENDESK_DOMAIN` and
    `ZENDESK_CLIENT_ID`.
 3. **The browser shows an invalid redirect URL**: The redirect URL registered
