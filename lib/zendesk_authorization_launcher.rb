@@ -2,18 +2,13 @@ require 'fileutils'
 require 'rbconfig'
 require_relative 'zendesk_token_store'
 
-# Starts the one-time authorization flow in the background when a tool call
-# finds no usable credentials.
-#
-# This runs inside the MCP server, whose STDOUT carries the JSON-RPC stream, so
-# two rules hold throughout: never block, and never let the child process touch
-# the parent's STDOUT.
+# Runs inside the MCP server, whose STDOUT carries the JSON-RPC stream. Two
+# rules hold throughout: never block, and never let the child touch STDOUT.
 class ZendeskAuthorizationLauncher
   LOG_BASENAME = "authorize.log"
   MARKER_BASENAME = "authorize.started"
   LOCK_BASENAME = "authorize.lock"
-  # How long a started flow is assumed to still be waiting for the developer.
-  # After this, a new attempt may open another browser.
+  # How long a started flow is assumed to still be waiting.
   IN_PROGRESS_SECONDS = 180
 
   def self.browser_available?
@@ -35,7 +30,7 @@ class ZendeskAuthorizationLauncher
     @spawner = spawner || method(:spawn_detached)
   end
 
-  # Returns the message the tool call should report. Never raises, never blocks.
+  # Never raises, never blocks.
   def launch(reason)
     return manual_message(reason) unless @enabled
     return manual_message(reason) unless @browser_available
@@ -77,9 +72,8 @@ class ZendeskAuthorizationLauncher
     pid
   end
 
-  # Records an attempt, and reports whether this caller won the right to start
-  # one. Several server processes can reach this at the same moment, so the
-  # check and the write happen under a lock.
+  # Several server processes can reach this at once, so the check and the write
+  # happen under a lock.
   def claim_attempt
     with_lock do
       next false if attempt_in_progress?
@@ -98,8 +92,7 @@ class ZendeskAuthorizationLauncher
     false
   end
 
-  # A short lock of its own, so claiming an attempt never waits on a token
-  # refresh holding the token file lock.
+  # A lock of its own, so this never waits on a token refresh.
   def with_lock
     File.open(File.join(@cache_dir, LOCK_BASENAME), File::RDWR | File::CREAT, 0o600) do |lock|
       lock.flock(File::LOCK_EX)
@@ -131,8 +124,6 @@ class ZendeskAuthorizationLauncher
     prefixed(reason, "Run: ruby #{@script_path} --authorize")
   end
 
-  # Callers without a specific cause should not produce a doubled sentence or a
-  # leading space.
   def prefixed(reason, text)
     return text if reason.to_s.strip.empty?
 

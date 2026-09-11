@@ -1,7 +1,6 @@
 require 'net/http'
 require 'openssl'
 
-# Shared HTTPS setup for every call to Zendesk, including the token endpoint.
 module ZendeskHttp
   module_function
 

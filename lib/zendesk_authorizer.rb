@@ -4,13 +4,6 @@ require 'uri'
 require_relative 'zendesk_pkce'
 require_relative 'zendesk_oauth'
 
-# Runs the one-time authorization code flow with PKCE, so this machine holds
-# tokens belonging to the developer who approved them.
-#
-# Zendesk redirects back to a loopback address after consent. This class listens
-# on that address for exactly one request, takes the authorization code, and
-# exchanges it for tokens. Nothing here runs while the MCP server serves
-# requests.
 class ZendeskAuthorizer
   class AuthorizationFailed < StandardError; end
 
@@ -23,7 +16,6 @@ class ZendeskAuthorizer
     SecureRandom.urlsafe_base64(24, false)
   end
 
-  # Reads the query parameters out of an HTTP request line.
   def self.parse_query(request_line)
     target = request_line.to_s.split(" ")[1].to_s
     query = target.split("?", 2)[1]
@@ -83,8 +75,7 @@ class ZendeskAuthorizer
     "https://#{@domain}#{AUTHORIZE_PATH}?#{query}"
   end
 
-  # Serves exactly one request, and always answers the browser, so the developer
-  # sees the outcome on the page rather than a connection error.
+  # Always answers the browser, so the outcome shows on the page.
   def wait_for_callback(server:, expected_state:)
     socket = server.accept
     params = self.class.parse_query(socket.gets)
@@ -109,8 +100,7 @@ class ZendeskAuthorizer
       raise AuthorizationFailed, detail
     end
 
-    # A state that does not match means this redirect belongs to some other
-    # request, not the one this process started.
+    # A mismatched state belongs to some other request, not this one.
     raise AuthorizationFailed, "The redirect carried the wrong state value." unless params["state"] == expected_state
 
     code = params["code"]
@@ -134,9 +124,8 @@ class ZendeskAuthorizer
 
   private
 
-  # Form encoding writes a space as "+". Some OAuth endpoints accept only
-  # "%20", so convert it. A literal "+" is already escaped to "%2B" by this
-  # point, so only spaces change.
+  # Some OAuth endpoints accept only "%20" for a space, not "+". A literal "+"
+  # is already "%2B" here, so only spaces change.
   def encode(value)
     URI.encode_www_form_component(value.to_s).gsub("+", "%20")
   end

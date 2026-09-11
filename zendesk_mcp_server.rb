@@ -11,8 +11,6 @@ require_relative 'lib/zendesk_token_store'
 require_relative 'lib/zendesk_http'
 
 class ZendeskMCPServer
-  # Reads the scopes to request. Narrowing these limits what the MCP server can
-  # do with the developer's own Zendesk permissions.
   def self.configured_scopes
     scopes = ENV['ZENDESK_OAUTH_SCOPES']
     return ZendeskOAuth::DEFAULT_SCOPES if scopes.to_s.empty?
@@ -37,8 +35,7 @@ class ZendeskMCPServer
 
     @launcher = launcher
 
-    # An injected token supplier is used by the tests, and skips configuration
-    # checks that only apply to the real one.
+    # Injected by the tests, which skip the configuration checks.
     if oauth
       @oauth = oauth
       return
@@ -443,8 +440,6 @@ class ZendeskMCPServer
       body: response.body
     }
   rescue ZendeskOAuth::AuthorizationRequired => e
-    # Start the browser flow if we can, and tell the developer what happens
-    # next, rather than showing a failed request.
     {
       error: authorization_message(e)
     }
@@ -454,7 +449,6 @@ class ZendeskMCPServer
     }
   end
 
-  # The launcher never blocks and never raises, so a tool call always answers.
   def authorization_message(error)
     return error.message if @launcher.nil?
 

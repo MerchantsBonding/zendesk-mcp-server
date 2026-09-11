@@ -4,15 +4,8 @@ require 'uri'
 require_relative 'zendesk_http'
 require_relative 'zendesk_token_store'
 
-# Supplies a Zendesk OAuth access token for the developer who authorized this
-# machine, and renews it with the refresh token grant.
-#
-# Tokens are obtained once by ZendeskAuthorizer. This class never prompts. When
-# it cannot renew, it raises AuthorizationRequired and names the command to run.
 class ZendeskOAuth
-  # Raised when no stored credential can be renewed. `reason` is the cause on
-  # its own, so a caller can compose its own guidance; `message` always ends
-  # with the fallback command.
+  # `reason` is the cause alone, so callers can word their own guidance.
   class AuthorizationRequired < StandardError
     COMMAND = "Run: ruby zendesk_mcp_server.rb --authorize"
 
@@ -31,12 +24,8 @@ class ZendeskOAuth
   MAX_REFRESH_EXPIRES_IN = 7_776_000
   # Retire a token early, to absorb clock skew between this host and Zendesk.
   EXPIRY_SKEW_SECONDS = 60
-  # Least privilege for the five tools this server exposes: they read across
-  # Zendesk, but the only thing they write is tickets. Broad "write" would also
-  # grant deleting users and organizations, which no tool here does.
-  #
-  # These must sit inside the OAuth client's Allowed scopes, or Zendesk answers
-  # the authorization request with "Invalid scope".
+  # Must sit inside the OAuth client's Allowed scopes, or Zendesk answers the
+  # authorization request with "Invalid scope".
   DEFAULT_SCOPES = "read tickets:write"
 
   def initialize(domain:, client_id:, scopes: DEFAULT_SCOPES, store: ZendeskTokenStore.new)
@@ -61,8 +50,7 @@ class ZendeskOAuth
     end
   end
 
-  # Marks the access token as spent, and keeps the refresh token. Used when
-  # Zendesk rejects a token that has not reached its expiry.
+  # Keeps the refresh token. Clearing it would force a needless re-authorization.
   def invalidate!
     @store.with_lock do
       record = @store.read
@@ -72,8 +60,6 @@ class ZendeskOAuth
     end
   end
 
-  # Exchanges grant parameters for tokens and stores them. Used by the
-  # authorization flow, which owns a different grant but the same record shape.
   def redeem(params)
     response = begin
       post_token_request(params)
@@ -117,8 +103,7 @@ class ZendeskOAuth
     record["expires_at"].to_i - EXPIRY_SKEW_SECONDS > Time.now.to_i
   end
 
-  # A stored record belongs to one Zendesk instance and one OAuth client, so
-  # changing either one requires authorizing again.
+  # Changing instance or client requires authorizing again.
   def usable?(record)
     return false unless record.is_a?(Hash)
     return false unless record["domain"] == @domain

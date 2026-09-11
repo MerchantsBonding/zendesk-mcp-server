@@ -1,13 +1,8 @@
 require 'json'
 require 'fileutils'
 
-# Reads and writes the OAuth token record, and guards it with an exclusive file
-# lock.
-#
-# The lock matters. Zendesk rotates refresh tokens on every use and accepts each
-# one only once. An MCP client starts one server process per session, so without
-# the lock two sessions can refresh with the same token, and the loser is left
-# holding a token Zendesk has already retired.
+# Zendesk accepts each refresh token once, and an MCP client runs one server
+# process per session, so writes here must be locked.
 class ZendeskTokenStore
   def self.default_path
     base = ENV["XDG_CACHE_HOME"]
@@ -42,8 +37,7 @@ class ZendeskTokenStore
     nil
   end
 
-  # Holds an exclusive lock for the duration of the block. The lock lives in a
-  # file of its own, so replacing the token file never drops it.
+  # The lock file is separate, so replacing the token file never drops the lock.
   def with_lock
     ensure_directory
     File.open(lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
@@ -56,7 +50,6 @@ class ZendeskTokenStore
     end
   end
 
-  # Takes the lock without blocking, and keeps it until the process exits.
   # Used by the tests to prove the lock excludes another process.
   def try_lock
     ensure_directory
