@@ -17,6 +17,21 @@ class ZendeskOAuth
     end
   end
 
+  # Raised for any non-2xx from the token endpoint. Only a rejected grant means
+  # this machine has to authorize again; a 5xx or a timeout is retryable.
+  class TokenRequestFailed < StandardError
+    attr_reader :status
+
+    def initialize(message, status: nil)
+      @status = status
+      super(message)
+    end
+
+    def grant_rejected?
+      [400, 401].include?(status)
+    end
+  end
+
   TOKEN_PATH = "/oauth/tokens"
   # Zendesk caps the access token at 48 hours and the refresh token at 90 days.
   # Ask for both maximums, because the defaults are 30 minutes and 30 days.
@@ -63,11 +78,15 @@ class ZendeskOAuth
   def redeem(params)
     response = begin
       post_token_request(params)
-    rescue StandardError => e
-      raise AuthorizationRequired, "Zendesk refused the authorization: #{e.message}."
+    rescue TokenRequestFailed => e
+      raise AuthorizationRequired, "Zendesk refused the authorization: #{e.message}." if e.grant_rejected?
+
+      raise
     end
 
-    save_token_response(response)
+    # --authorize runs while MCP server processes keep running, so this write
+    # needs the lock like every other write to the file.
+    @store.with_lock { save_token_response(response) }
   end
 
   def save_token_response(response, previous_refresh_token: nil)
@@ -128,8 +147,10 @@ class ZendeskOAuth
         "expires_in" => MAX_EXPIRES_IN,
         "refresh_token_expires_in" => MAX_REFRESH_EXPIRES_IN
       )
-    rescue StandardError => e
-      raise AuthorizationRequired, "Zendesk refused the refresh token: #{e.message}."
+    rescue TokenRequestFailed => e
+      raise AuthorizationRequired, "Zendesk refused the refresh token: #{e.message}." if e.grant_rejected?
+
+      raise
     end
 
     save_token_response(response, previous_refresh_token: refresh_token)
@@ -151,7 +172,8 @@ class ZendeskOAuth
 
     response = ZendeskHttp.client(uri).request(request)
     unless response.code.to_i.between?(200, 299)
-      raise "HTTP #{response.code}: #{response.body}"
+      raise TokenRequestFailed.new("HTTP #{response.code}: #{response.body}",
+                                 status: response.code.to_i)
     end
 
     JSON.parse(response.body)

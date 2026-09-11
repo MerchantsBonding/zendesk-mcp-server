@@ -62,7 +62,7 @@ entry point. The auth machinery lives beside it:
 |---|---|
 | `lib/zendesk_http.rb` | Shared TLS setup, including the CRL workaround |
 | `lib/zendesk_pkce.rb` | PKCE verifier and S256 challenge |
-| `lib/zendesk_token_store.rb` | Reads, writes and **locks** the token file |
+| `lib/zendesk_token_store.rb` | Reads, writes (by rename) and **locks** the token file |
 | `lib/zendesk_oauth.rb` | Supplies access tokens, refreshes them |
 | `lib/zendesk_authorizer.rb` | The one-time `--authorize` browser flow |
 | `lib/zendesk_authorization_launcher.rb` | Starts that flow in the background when a call finds no auth |
@@ -144,6 +144,10 @@ corrupts every response. `spawn_options` therefore sends the child's output to
 Note that `ZendeskAuthorizer` still defaults `io:` to `$stdout`, which is correct
 for the CLI path and wrong inside the server. The launcher avoids the problem by
 spawning a separate process rather than calling the authorizer in-process.
+
+**Only a 400 or 401 from the token endpoint means re-authorization.** `TokenRequestFailed`
+carries the status; a 5xx or a transport error must propagate as an ordinary failure.
+Converting them all to `AuthorizationRequired` made a dropped VPN open a consent page.
 
 **`invalidate!` must keep the refresh token.** It expires only the access token. Clearing
 both on a 401 would force the developer through the browser flow again for what is usually

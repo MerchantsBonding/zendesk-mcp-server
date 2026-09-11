@@ -282,7 +282,7 @@ class TestCodeExchange < Minitest::Test
   end
 
   def test_a_rejected_code_is_reported_as_a_failure
-    authorizer, = build(results: [StandardError.new("HTTP 400: invalid_grant")])
+    authorizer, = build(results: [ZendeskOAuth::TokenRequestFailed.new("HTTP 400: invalid_grant", status: 400)])
 
     assert_raises(ZendeskOAuth::AuthorizationRequired) do
       authorizer.exchange(code: "bad", verifier: "v")
@@ -317,5 +317,109 @@ class TestScopeEncoding < Minitest::Test
 
     assert_equal "read write", params["scope"]
     assert_equal REDIRECT_URI, params["redirect_uri"]
+  end
+end
+
+class TestListenerRobustness < Minitest::Test
+  def build
+    ZendeskAuthorizer.new(
+      domain: AUTH_DOMAIN, client_id: AUTH_CLIENT_ID, scopes: "read",
+      redirect_uri: REDIRECT_URI, oauth: nil, io: StringIO.new
+    )
+  end
+
+
+# Never block the suite on a server that is not answering.
+def read_with_deadline(socket, seconds)
+  deadline = Time.now + seconds
+  buffer = +""
+  loop do
+    remaining = deadline - Time.now
+    break if remaining <= 0
+    break unless IO.select([socket], nil, nil, remaining)
+
+    chunk = socket.read_nonblock(4096, exception: false)
+    break if chunk.nil?
+    next if chunk == :wait_readable
+
+    buffer << chunk
+  end
+  buffer
+end
+
+  def serve(requests, timeout: 5)
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.addr[1]
+    result = nil
+    error = nil
+
+    listener = Thread.new do
+      begin
+        result = build.wait_for_callback(server: server, expected_state: "xyz", timeout: timeout)
+      rescue ZendeskAuthorizer::AuthorizationFailed => e
+        error = e
+      end
+    end
+
+    responses = requests.map do |line|
+      socket = TCPSocket.new("127.0.0.1", port)
+      socket.print("#{line}\r\nHost: localhost\r\n\r\n")
+      body = read_with_deadline(socket, 3)
+      socket.close
+      body
+    end
+
+    listener.join(5)
+    server.close unless server.closed?
+    [result, error, responses]
+  end
+
+  # A browser preconnect, a favicon probe or a security agent can reach the port
+  # first. Consuming the only accept on one of those loses the real redirect.
+  def test_an_unrelated_request_does_not_consume_the_callback
+    result, error, responses = serve([
+      "GET /favicon.ico HTTP/1.1",
+      "GET /callback?code=abc&state=xyz HTTP/1.1"
+    ])
+
+    assert_nil error
+    assert_equal "abc", result
+    assert_match(%r{^HTTP/1\.1 404}, responses[0])
+    assert_match(%r{^HTTP/1\.1 200}, responses[1])
+  end
+
+  # An unanswered browser must not hold port 4567 for the life of the machine.
+  def test_the_listener_gives_up_after_the_timeout
+    _result, error, = serve([], timeout: 0.3)
+
+    refute_nil error
+    assert_match(/timed out/i, error.message)
+  end
+
+  # parse_query used to sit outside the rescue, so this closed the socket with
+  # no HTTP response at all.
+  def test_malformed_encoding_still_answers_the_browser
+    _result, error, responses = serve(["GET /callback?state=%ZZ HTTP/1.1"])
+
+    refute_nil error
+    assert_match(%r{^HTTP/1\.1 400}, responses[0])
+  end
+
+  def test_the_port_is_released_once_the_flow_ends
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.addr[1]
+
+    thread = Thread.new do
+      begin
+        build.wait_for_callback(server: server, expected_state: "xyz", timeout: 0.2)
+      rescue ZendeskAuthorizer::AuthorizationFailed
+        nil
+      end
+    end
+    thread.join(5)
+    server.close unless server.closed?
+
+    reopened = TCPServer.new("127.0.0.1", port)
+    reopened.close
   end
 end

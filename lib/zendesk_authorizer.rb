@@ -11,17 +11,30 @@ class ZendeskAuthorizer
   # The redirect URL must match one registered on the OAuth client, so the port
   # is fixed rather than chosen at run time.
   DEFAULT_REDIRECT_URI = "http://localhost:4567/callback"
+  # An unanswered browser must not hold the port forever. The launcher's
+  # in-progress window is derived from this, so the child is gone before a
+  # replacement is started.
+  CALLBACK_TIMEOUT_SECONDS = 150
 
   def self.generate_state
     SecureRandom.urlsafe_base64(24, false)
   end
 
   def self.parse_query(request_line)
-    target = request_line.to_s.split(" ")[1].to_s
-    query = target.split("?", 2)[1]
+    query = target(request_line).split("?", 2)[1]
     return {} if query.to_s.empty?
 
     URI.decode_www_form(query).to_h
+  rescue ArgumentError
+    {}
+  end
+
+  def self.parse_path(request_line)
+    target(request_line).split("?", 2).first.to_s
+  end
+
+  def self.target(request_line)
+    request_line.to_s.split(" ")[1].to_s
   end
 
   def initialize(domain:, client_id:, oauth:, scopes: ZendeskOAuth::DEFAULT_SCOPES,
@@ -76,21 +89,39 @@ class ZendeskAuthorizer
   end
 
   # Always answers the browser, so the outcome shows on the page.
-  def wait_for_callback(server:, expected_state:)
-    socket = server.accept
-    params = self.class.parse_query(socket.gets)
-    discard_headers(socket)
+  # Answers every request that arrives, and keeps listening until the redirect
+  # shows up or the deadline passes. A browser preconnect or a favicon probe can
+  # reach the port first, and must not consume the one chance to read the code.
+  def wait_for_callback(server:, expected_state:, timeout: CALLBACK_TIMEOUT_SECONDS)
+    deadline = Time.now + timeout
 
-    begin
-      code = code_from(params, expected_state: expected_state)
-      respond(socket, 200, "Authorization complete. You can close this tab.")
-      code
-    rescue AuthorizationFailed => e
-      respond(socket, 400, "Authorization failed. #{e.message}")
-      raise
+    loop do
+      remaining = deadline - Time.now
+      raise AuthorizationFailed, timed_out_message if remaining <= 0
+      raise AuthorizationFailed, timed_out_message unless IO.select([server], nil, nil, remaining)
+
+      socket = server.accept
+      begin
+        line = socket.gets
+        path = self.class.parse_path(line)
+        params = self.class.parse_query(line)
+        discard_headers(socket)
+
+        if path != callback_path
+          respond(socket, 404, "Not found.")
+          next
+        end
+
+        code = code_from(params, expected_state: expected_state)
+        respond(socket, 200, "Authorization complete. You can close this tab.")
+        return code
+      rescue AuthorizationFailed => e
+        respond(socket, 400, "Authorization failed. #{e.message}")
+        raise
+      ensure
+        socket.close
+      end
     end
-  ensure
-    socket&.close
   end
 
   def code_from(params, expected_state:)
@@ -130,6 +161,14 @@ class ZendeskAuthorizer
     URI.encode_www_form_component(value.to_s).gsub("+", "%20")
   end
 
+  def timed_out_message
+    "Timed out waiting for the browser redirect."
+  end
+
+  def callback_path
+    URI(@redirect_uri).path
+  end
+
   def redirect_host
     URI(@redirect_uri).host
   end
@@ -145,8 +184,7 @@ class ZendeskAuthorizer
   end
 
   def respond(socket, status, message)
-    reason = "OK"
-    reason = "Bad Request" unless status == 200
+    reason = { 200 => "OK", 400 => "Bad Request", 404 => "Not Found" }.fetch(status, "Error")
 
     body = "<!doctype html><meta charset=\"utf-8\">" \
            "<title>Zendesk MCP Server</title>" \

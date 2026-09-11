@@ -105,3 +105,43 @@ class TestZendeskTokenStore < Minitest::Test
     assert acquired, "the lock was not released"
   end
 end
+
+class TestAtomicWrites < Minitest::Test
+  def setup
+    @dir = Dir.mktmpdir
+    @path = File.join(@dir, "token.json")
+    @store = ZendeskTokenStore.new(path: @path)
+  end
+
+  def teardown
+    FileUtils.remove_entry(@dir)
+  end
+
+  # Writing in place truncates the file first, so a crash mid-write destroys the
+  # refresh token. Replacing by rename keeps the old record readable until the
+  # new one is complete, and swaps the inode rather than reusing it.
+  def test_the_record_is_replaced_rather_than_overwritten_in_place
+    @store.write("access_token" => "first")
+    first_inode = File.stat(@path).ino
+
+    @store.write("access_token" => "second")
+
+    refute_equal first_inode, File.stat(@path).ino,
+                 "expected the file to be replaced atomically, not truncated and rewritten"
+    assert_equal "second", @store.read["access_token"]
+  end
+
+  def test_no_temporary_files_are_left_behind
+    @store.write("access_token" => "good")
+
+    leftovers = Dir.children(@dir).reject { |name| name == "token.json" || name.end_with?(".lock") }
+    assert_empty leftovers, "the temporary file was not cleaned up"
+  end
+
+  def test_a_replacement_write_keeps_owner_only_permissions
+    @store.write("access_token" => "first")
+    @store.write("access_token" => "second")
+
+    assert_equal 0o600, File.stat(@path).mode & 0o777
+  end
+end

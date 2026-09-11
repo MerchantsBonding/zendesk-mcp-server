@@ -172,7 +172,7 @@ class TestZendeskOAuth < Minitest::Test
   def test_a_rejected_refresh_token_asks_the_developer_to_authorize
     save(expires_at: Time.now.to_i - 1)
 
-    oauth = build(results: [StandardError.new("HTTP 400: invalid_grant")])
+    oauth = build(results: [ZendeskOAuth::TokenRequestFailed.new("HTTP 400: invalid_grant", status: 400)])
 
     error = assert_raises(ZendeskOAuth::AuthorizationRequired) { oauth.access_token }
     assert_match(/--authorize/, error.message)
@@ -305,5 +305,91 @@ class TestAuthorizationRequiredReason < Minitest::Test
 
     assert_nil error.reason
     assert_includes error.message, "--authorize"
+  end
+end
+
+class TestTransportFailuresAreNotAuthorizationFailures < Minitest::Test
+  def setup
+    @dir = Dir.mktmpdir
+    @store = ZendeskTokenStore.new(path: File.join(@dir, "token.json"))
+    @store.write(
+      "access_token" => "stale", "expires_at" => Time.now.to_i - 1,
+      "refresh_token" => "refresh-1", "refresh_expires_at" => Time.now.to_i + 86_400,
+      "domain" => DOMAIN, "client_id" => CLIENT_ID
+    )
+  end
+
+  def teardown
+    FileUtils.remove_entry(@dir)
+  end
+
+  def build(error)
+    StubOAuth.new(results: [error], domain: DOMAIN, client_id: CLIENT_ID, store: @store)
+  end
+
+  def test_a_400_means_the_grant_is_dead_and_asks_for_re_authorization
+    error = ZendeskOAuth::TokenRequestFailed.new("HTTP 400: invalid_grant", status: 400)
+
+    assert_raises(ZendeskOAuth::AuthorizationRequired) { build(error).access_token }
+  end
+
+  def test_a_401_also_asks_for_re_authorization
+    error = ZendeskOAuth::TokenRequestFailed.new("HTTP 401: unauthorized", status: 401)
+
+    assert_raises(ZendeskOAuth::AuthorizationRequired) { build(error).access_token }
+  end
+
+  # A Zendesk outage does not mean this machine lost its authorization, and must
+  # not send the developer through the browser flow.
+  def test_a_500_does_not_ask_for_re_authorization
+    error = ZendeskOAuth::TokenRequestFailed.new("HTTP 500: boom", status: 500)
+
+    raised = assert_raises(ZendeskOAuth::TokenRequestFailed) { build(error).access_token }
+    refute_kind_of ZendeskOAuth::AuthorizationRequired, raised
+  end
+
+  def test_a_network_failure_does_not_ask_for_re_authorization
+    raised = assert_raises(SocketError) { build(SocketError.new("getaddrinfo failed")).access_token }
+
+    refute_kind_of ZendeskOAuth::AuthorizationRequired, raised
+  end
+
+  def test_the_refresh_token_is_kept_when_the_failure_was_transport
+    begin
+      build(SocketError.new("offline")).access_token
+    rescue SocketError
+      nil
+    end
+
+    assert_equal "refresh-1", @store.read["refresh_token"]
+  end
+end
+
+class TestRedeemTakesTheLock < Minitest::Test
+  def setup
+    @dir = Dir.mktmpdir
+    @path = File.join(@dir, "token.json")
+  end
+
+  def teardown
+    FileUtils.remove_entry(@dir)
+  end
+
+  # --authorize runs as a separate process while MCP servers keep running, so
+  # its write must be locked like every other write to this file.
+  def test_the_token_file_is_written_under_the_lock
+    locked = []
+    store = Class.new(ZendeskTokenStore) do
+      define_method(:with_lock) { |&block| locked << :held; super(&block) }
+      define_method(:write) { |record| locked << :write; super(record) }
+    end.new(path: @path)
+
+    oauth = StubOAuth.new(
+      results: [{ "access_token" => "a", "refresh_token" => "r", "expires_in" => 100 }],
+      domain: DOMAIN, client_id: CLIENT_ID, store: store
+    )
+    oauth.redeem("grant_type" => "authorization_code")
+
+    assert_equal %i[held write], locked, "the write must happen inside the lock"
   end
 end

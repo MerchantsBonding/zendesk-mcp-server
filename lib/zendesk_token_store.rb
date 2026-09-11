@@ -24,11 +24,19 @@ class ZendeskTokenStore
     nil
   end
 
+  # Replaces the record by rename. Writing in place would truncate the file
+  # first, so a crash mid-write would destroy the refresh token.
   def write(record)
     ensure_directory
-    File.write(@path, JSON.generate(record))
-    File.chmod(0o600, @path)
+    temp = "#{@path}.#{Process.pid}.tmp"
+
+    File.open(temp, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+      file.write(JSON.generate(record))
+    end
+    File.rename(temp, @path)
     record
+  ensure
+    File.delete(temp) if temp && File.exist?(temp)
   end
 
   def delete

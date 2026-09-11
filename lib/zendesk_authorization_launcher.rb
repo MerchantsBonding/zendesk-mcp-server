@@ -1,6 +1,7 @@
 require 'fileutils'
 require 'rbconfig'
 require_relative 'zendesk_token_store'
+require_relative 'zendesk_authorizer'
 
 # Runs inside the MCP server, whose STDOUT carries the JSON-RPC stream. Two
 # rules hold throughout: never block, and never let the child touch STDOUT.
@@ -8,8 +9,9 @@ class ZendeskAuthorizationLauncher
   LOG_BASENAME = "authorize.log"
   MARKER_BASENAME = "authorize.started"
   LOCK_BASENAME = "authorize.lock"
-  # How long a started flow is assumed to still be waiting.
-  IN_PROGRESS_SECONDS = 180
+  # Outlives the child's own deadline, so a flow is never declared over while
+  # its process still holds the port.
+  IN_PROGRESS_SECONDS = ZendeskAuthorizer::CALLBACK_TIMEOUT_SECONDS + 30
 
   def self.browser_available?
     RUBY_PLATFORM.include?("darwin") || RUBY_PLATFORM.include?("linux")
@@ -38,7 +40,6 @@ class ZendeskAuthorizationLauncher
     FileUtils.mkdir_p(@cache_dir, mode: 0o700)
     return in_progress_message(reason) unless claim_attempt
 
-    @spawner.call(authorize_command, log_path)
     started_message(reason)
   rescue StandardError
     # A tool call must still answer, even when the flow cannot be started.
@@ -78,18 +79,34 @@ class ZendeskAuthorizationLauncher
     with_lock do
       next false if attempt_in_progress?
 
-      File.write(marker_path, Time.now.to_i.to_s)
+      pid = @spawner.call(authorize_command, log_path)
+      File.write(marker_path, "#{pid} #{Time.now.to_i}")
       true
     end
   end
 
+  # A child that died at once is not a flow in progress. Reporting one would
+  # point the developer at a browser that never opened.
   def attempt_in_progress?
     return false unless File.exist?(marker_path)
 
-    started = File.read(marker_path).to_i
-    Time.now.to_i - started < IN_PROGRESS_SECONDS
+    pid, started = File.read(marker_path).split.map(&:to_i)
+    return false if Time.now.to_i - started.to_i >= IN_PROGRESS_SECONDS
+
+    process_alive?(pid)
   rescue SystemCallError
     false
+  end
+
+  def process_alive?(pid)
+    return false unless pid.positive?
+
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH
+    false
+  rescue Errno::EPERM
+    true
   end
 
   # A lock of its own, so this never waits on a token refresh.

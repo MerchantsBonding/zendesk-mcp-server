@@ -80,17 +80,29 @@ class TestAuthorizationLauncher < Minitest::Test
     assert_match(/already in progress/i, message)
   end
 
-  def test_a_stale_marker_allows_a_new_flow
+  # A live process whose marker has aged out: the child is assumed to have given
+  # up waiting for the browser, so a fresh attempt is allowed.
+  def test_a_marker_older_than_the_window_allows_a_new_flow
     launcher = build
     launcher.launch(REASON)
 
-    marker = File.join(@dir, "authorize.started")
-    old = Time.now - ZendeskAuthorizationLauncher::IN_PROGRESS_SECONDS - 1
-    File.write(marker, old.to_i.to_s)
+    stale = Time.now.to_i - ZendeskAuthorizationLauncher::IN_PROGRESS_SECONDS - 1
+    File.write(File.join(@dir, "authorize.started"), "#{Process.pid} #{stale}")
 
     launcher.launch(REASON)
 
     assert_equal 2, @spawns.length
+  end
+
+  def test_a_marker_inside_the_window_with_a_live_process_blocks_a_new_flow
+    launcher = build
+    launcher.launch(REASON)
+
+    File.write(File.join(@dir, "authorize.started"), "#{Process.pid} #{Time.now.to_i}")
+
+    launcher.launch(REASON)
+
+    assert_equal 1, @spawns.length
   end
 
   def test_nothing_is_started_when_disabled
@@ -194,5 +206,91 @@ class TestMessagesWithoutAReason < Minitest::Test
 
   def test_an_empty_reason_is_treated_as_no_reason
     assert build.launch("").start_with?("A browser has opened")
+  end
+end
+
+class TestMarkerTracksTheChild < Minitest::Test
+  def setup
+    @dir = Dir.mktmpdir
+    @spawns = []
+  end
+
+  def teardown
+    FileUtils.remove_entry(@dir)
+  end
+
+  def build(pid: 4242)
+    ZendeskAuthorizationLauncher.new(
+      script_path: SCRIPT, cache_dir: @dir, enabled: true, browser_available: true,
+      spawner: ->(command, log) { @spawns << [command, log]; pid }
+    )
+  end
+
+  def marker
+    File.join(@dir, "authorize.started")
+  end
+
+  # If the child dies at once (port taken, no network), reporting "already in
+  # progress" for three minutes sends the developer nowhere.
+  def test_a_dead_child_does_not_count_as_a_flow_in_progress
+    dead = 99_999_998
+    File.write(marker, "#{dead} #{Time.now.to_i}")
+
+    message = build.launch(REASON)
+
+    assert_equal 1, @spawns.length
+    assert_includes message, "browser"
+  end
+
+  def test_a_live_child_does_count_as_a_flow_in_progress
+    File.write(marker, "#{Process.pid} #{Time.now.to_i}")
+
+    message = build.launch(REASON)
+
+    assert_empty @spawns
+    assert_match(/already in progress/i, message)
+  end
+
+  def test_the_marker_records_the_spawned_child
+    build(pid: 5150).launch(REASON)
+
+    assert_equal 5150, File.read(marker).split.first.to_i
+  end
+end
+
+class TestMalformedMarker < Minitest::Test
+  def setup
+    @dir = Dir.mktmpdir
+    @spawns = []
+  end
+
+  def teardown
+    FileUtils.remove_entry(@dir)
+  end
+
+  def build
+    ZendeskAuthorizationLauncher.new(
+      script_path: SCRIPT, cache_dir: @dir, enabled: true, browser_available: true,
+      spawner: ->(command, log) { @spawns << [command, log]; 4242 }
+    )
+  end
+
+  # A marker left by an older version, or a truncated one, must not stop the
+  # flow from starting.
+  def test_an_unreadable_marker_does_not_block_a_new_flow
+    File.write(File.join(@dir, "authorize.started"), "garbage")
+
+    message = build.launch(REASON)
+
+    assert_equal 1, @spawns.length
+    assert_includes message, "browser"
+  end
+
+  def test_an_empty_marker_does_not_block_a_new_flow
+    File.write(File.join(@dir, "authorize.started"), "")
+
+    build.launch(REASON)
+
+    assert_equal 1, @spawns.length
   end
 end
