@@ -7,7 +7,7 @@ A Model Context Protocol (MCP) server that provides integration with Zendesk Sup
 This MCP server enables the following Zendesk operations:
 
 - **Search tickets** - Search for tickets with custom queries and filters
-- **Get ticket details** - Retrieve full details of a specific ticket including comments
+- **Get ticket details** - Retrieve full details of a specific ticket
 - **Create tickets** - Create new support tickets
 - **Update tickets** - Update ticket status, priority, or add comments
 - **List users** - List Zendesk users with role filtering
@@ -126,13 +126,21 @@ Create or update your `.mcp.json` file (typically located in your project root o
   "mcpServers": {
     "zendesk": {
       "command": "ruby",
-      "args": ["path/to/zendesk_mcp_server.rb"]
+      "args": ["path/to/zendesk_mcp_server.rb"],
+      "env": {
+        "ZENDESK_DOMAIN": "your-subdomain.zendesk.com",
+        "ZENDESK_CLIENT_ID": "the-oauth-client-unique-identifier"
+      }
     }
   }
 }
 ```
 
 Replace `path/to/zendesk_mcp_server.rb` with the actual path to the `zendesk_mcp_server.rb` file in this repository.
+
+Most MCP clients do not pass your shell environment to the server, so set the
+variables in the `env` block as well as in your shell. Restart the client after
+changing them.
 
 ## Usage
 
@@ -188,18 +196,24 @@ The server also provides these read-only resources:
    be identical, including the port and the path.
 4. **`Port 4567 is already in use`**: Something else holds the port. Close it,
    or register a different redirect URL and set `ZENDESK_OAUTH_REDIRECT_URI`.
+   An authorization you walk away from releases the port by itself after 150
+   seconds, so this is not left behind by an abandoned browser tab.
 5. **`Invalid Authorization Request` / `Invalid scope`** in the browser: the
    OAuth client's **Allowed scopes** does not grant everything in
    `ZENDESK_OAUTH_SCOPES`. Widen the client's allowed scopes, clear the field
    to allow all, or narrow the variable. The scope values themselves are
    valid; this is a client configuration problem.
-6. **`HTTP 403`** on a tool call:
- Your Zendesk user lacks permission for that
+6. **`HTTP 403`** on a tool call: Your Zendesk user lacks permission for that
    action, or `ZENDESK_OAUTH_SCOPES` is too narrow.
 7. **Authorization keeps being requested**: Check that the token file is
    writable, at `~/.cache/zendesk-mcp-server/token.json`.
-8. **Connection errors**: Verify your ZENDESK_DOMAIN is correct (should be your-subdomain.zendesk.com)
-9. **Missing dependencies**: This server uses only Ruby standard library, no gems required
+8. **`Request failed: ...`**: The call did not reach Zendesk, or Zendesk
+   returned a server error. This is not an authorization problem and does not
+   open a browser. Retry, and check `ZENDESK_DOMAIN` is correct (it should be
+   your-subdomain.zendesk.com).
+9. **`Timed out waiting for the browser redirect`**: The consent page was not
+   approved in time. Run the request again, or `--authorize` directly.
+10. **Missing dependencies**: This server uses only Ruby standard library, no gems required
 
 ## Testing
 
