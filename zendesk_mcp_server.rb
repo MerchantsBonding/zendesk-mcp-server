@@ -3,20 +3,53 @@
 require 'json'
 require 'net/http'
 require 'uri'
-require 'base64'
 require 'logger'
-require 'openssl'
+require_relative 'lib/zendesk_oauth'
+require_relative 'lib/zendesk_authorizer'
+require_relative 'lib/zendesk_authorization_launcher'
+require_relative 'lib/zendesk_token_store'
+require_relative 'lib/zendesk_http'
 
 class ZendeskMCPServer
-  def initialize
+  def self.configured_scopes
+    scopes = ENV['ZENDESK_OAUTH_SCOPES']
+    return ZendeskOAuth::DEFAULT_SCOPES if scopes.to_s.empty?
+
+    scopes
+  end
+
+  # Must match a redirect URL registered on the OAuth client.
+  def self.configured_redirect_uri
+    uri = ENV['ZENDESK_OAUTH_REDIRECT_URI']
+    return ZendeskAuthorizer::DEFAULT_REDIRECT_URI if uri.to_s.empty?
+
+    uri
+  end
+
+  def initialize(oauth: nil, launcher: nil)
     @logger = Logger.new(STDERR)
     @logger.level = Logger::INFO
 
     @zendesk_domain = ENV['ZENDESK_DOMAIN']
-    @zendesk_email = ENV['ZENDESK_EMAIL']
-    @zendesk_token = ENV['ZENDESK_API_TOKEN']
+    @client_id = ENV['ZENDESK_CLIENT_ID']
+
+    @launcher = launcher
+
+    # Injected by the tests, which skip the configuration checks.
+    if oauth
+      @oauth = oauth
+      return
+    end
 
     validate_configuration!
+
+    @oauth = ZendeskOAuth.new(
+      domain: @zendesk_domain,
+      client_id: @client_id,
+      scopes: self.class.configured_scopes
+    )
+
+    @launcher ||= ZendeskAuthorizationLauncher.new(script_path: File.expand_path(__FILE__))
   end
 
   def run
@@ -60,13 +93,12 @@ class ZendeskMCPServer
 
   def validate_configuration!
     missing = []
-    missing << "ZENDESK_DOMAIN" unless @zendesk_domain
-    missing << "ZENDESK_EMAIL" unless @zendesk_email
-    missing << "ZENDESK_TOKEN" unless @zendesk_token
+    missing << "ZENDESK_DOMAIN" if @zendesk_domain.to_s.empty?
+    missing << "ZENDESK_CLIENT_ID" if @client_id.to_s.empty?
 
-    if missing.any?
-      raise "Missing required environment variables: #{missing.join(', ')}"
-    end
+    return if missing.empty?
+
+    raise "Missing required environment variables: #{missing.join(', ')}"
   end
 
   def handle_request(request)
@@ -382,56 +414,102 @@ class ZendeskMCPServer
     zendesk_request("GET", endpoint)
   end
 
-  def zendesk_request(method, endpoint, data = nil)
+  def zendesk_request(method, endpoint, data = nil, retry_on_auth_failure: true)
     uri = URI("https://#{@zendesk_domain}#{endpoint}")
+    request = build_request(method, uri, data)
 
-    http = Net::HTTP.new(uri.host, uri.port)
-    http.use_ssl = true
-    http.verify_mode = OpenSSL::SSL::VERIFY_PEER
-    # Skip CRL verification errors (codes 3, 4) while keeping cert validation
-    http.verify_callback = ->(preverify_ok, store_ctx) {
-      return true if [3, 4].include?(store_ctx.error)  # CRL errors
-      preverify_ok
-    }
-
-    case method.upcase
-    when "GET"
-      request = Net::HTTP::Get.new(uri)
-    when "POST"
-      request = Net::HTTP::Post.new(uri)
-      request.body = data.to_json if data
-    when "PUT"
-      request = Net::HTTP::Put.new(uri)
-      request.body = data.to_json if data
-    else
-      raise "Unsupported HTTP method: #{method}"
-    end
-
-    # Set authentication header
-    credentials = Base64.strict_encode64("#{@zendesk_email}/token:#{@zendesk_token}")
-    request["Authorization"] = "Basic #{credentials}"
+    request["Authorization"] = "Bearer #{@oauth.access_token}"
     request["Content-Type"] = "application/json"
     request["Accept"] = "application/json"
 
-    response = http.request(request)
+    response = perform_http(uri, request)
+    code = response.code.to_i
 
-    if response.code.to_i >= 200 && response.code.to_i < 300
-      JSON.parse(response.body)
-    else
-      {
-        error: "HTTP #{response.code}: #{response.message}",
-        body: response.body
-      }
+    return JSON.parse(response.body) if code.between?(200, 299)
+
+    # Zendesk can revoke a token before it expires, so checking the expiry is
+    # not enough. Discard the cached token and try once with a fresh one.
+    if code == 401 && retry_on_auth_failure
+      @logger.warn("Zendesk rejected the access token, minting a new one")
+      @oauth.invalidate!
+      return zendesk_request(method, endpoint, data, retry_on_auth_failure: false)
     end
+
+    {
+      error: "HTTP #{response.code}: #{response.message}",
+      body: response.body
+    }
+  rescue ZendeskOAuth::AuthorizationRequired => e
+    {
+      error: authorization_message(e)
+    }
   rescue => e
     {
       error: "Request failed: #{e.message}"
     }
   end
+
+  def authorization_message(error)
+    return error.message if @launcher.nil?
+
+    @launcher.launch(error.reason)
+  end
+
+  def build_request(method, uri, data)
+    case method.upcase
+    when "GET"
+      Net::HTTP::Get.new(uri)
+    when "POST"
+      request = Net::HTTP::Post.new(uri)
+      request.body = data.to_json if data
+      request
+    when "PUT"
+      request = Net::HTTP::Put.new(uri)
+      request.body = data.to_json if data
+      request
+    else
+      raise "Unsupported HTTP method: #{method}"
+    end
+  end
+
+  def perform_http(uri, request)
+    ZendeskHttp.client(uri).request(request)
+  end
+end
+
+def self.authorize!
+  domain = ENV['ZENDESK_DOMAIN']
+  client_id = ENV['ZENDESK_CLIENT_ID']
+
+  missing = []
+  missing << "ZENDESK_DOMAIN" if domain.to_s.empty?
+  missing << "ZENDESK_CLIENT_ID" if client_id.to_s.empty?
+  raise "Missing required environment variables: #{missing.join(', ')}" if missing.any?
+
+  scopes = ZendeskMCPServer.configured_scopes
+  oauth = ZendeskOAuth.new(domain: domain, client_id: client_id, scopes: scopes)
+
+  ZendeskAuthorizer.new(
+    domain: domain,
+    client_id: client_id,
+    scopes: scopes,
+    redirect_uri: ZendeskMCPServer.configured_redirect_uri,
+    oauth: oauth
+  ).run
 end
 
 # Run the server if this file is executed directly
 if __FILE__ == $0
+  if ARGV.include?("--authorize")
+    begin
+      authorize!
+      exit 0
+    rescue => e
+      STDERR.puts "Authorization failed: #{e.message}"
+      exit 1
+    end
+  end
+
   begin
     server = ZendeskMCPServer.new
     server.run
