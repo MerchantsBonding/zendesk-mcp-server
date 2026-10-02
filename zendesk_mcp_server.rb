@@ -11,6 +11,10 @@ require_relative 'lib/zendesk_token_store'
 require_relative 'lib/zendesk_http'
 
 class ZendeskMCPServer
+  # Zendesk's largest cursor page. Five of them caps a thread at 500 comments.
+  COMMENT_PAGE_SIZE = 100
+  MAX_COMMENT_PAGES = 5
+
   def self.configured_scopes
     scopes = ENV['ZENDESK_OAUTH_SCOPES']
     return ZendeskOAuth::DEFAULT_SCOPES if scopes.to_s.empty?
@@ -188,6 +192,20 @@ class ZendeskMCPServer
             }
           },
           {
+            name: "get_ticket_comments",
+            description: "Get every comment on a ticket, oldest first, including internal notes (public: false)",
+            inputSchema: {
+              type: "object",
+              properties: {
+                ticket_id: {
+                  type: "integer",
+                  description: "The ticket ID"
+                }
+              },
+              required: ["ticket_id"]
+            }
+          },
+          {
             name: "create_ticket",
             description: "Create a new ticket",
             inputSchema: {
@@ -280,6 +298,8 @@ class ZendeskMCPServer
                search_tickets(arguments)
              when "get_ticket"
                get_ticket(arguments)
+             when "get_ticket_comments"
+               get_ticket_comments(arguments)
              when "create_ticket"
                create_ticket(arguments)
              when "update_ticket"
@@ -368,7 +388,62 @@ class ZendeskMCPServer
 
   def get_ticket(args)
     ticket_id = args["ticket_id"]
-    zendesk_request("GET", "/api/v2/tickets/#{ticket_id}.json?include=comments,users")
+    zendesk_request("GET", "/api/v2/tickets/#{ticket_id}.json?include=users")
+  end
+
+  # Follows cursor pages until the thread ends or the cap is reached, and
+  # trims each comment to what a reader needs.
+  def get_ticket_comments(args)
+    ticket_id = args["ticket_id"]
+    endpoint = "/api/v2/tickets/#{ticket_id}/comments.json?include=users&page[size]=#{COMMENT_PAGE_SIZE}"
+    comments = []
+    users = {}
+    pages = 0
+
+    loop do
+      page = zendesk_request("GET", endpoint)
+      return page if page.key?(:error)
+
+      pages += 1
+      comments.concat(page["comments"] || [])
+      (page["users"] || []).each { |user| users[user["id"]] = user }
+
+      next_url = page.dig("links", "next")
+      break unless page.dig("meta", "has_more") && next_url
+      return comment_summary(ticket_id, comments, users, truncated: true) if pages >= MAX_COMMENT_PAGES
+
+      endpoint = URI(next_url).request_uri
+    end
+
+    comment_summary(ticket_id, comments, users, truncated: false)
+  end
+
+  def comment_summary(ticket_id, comments, users, truncated:)
+    {
+      ticket_id: ticket_id,
+      count: comments.length,
+      truncated: truncated,
+      comments: comments.map { |comment| trim_comment(comment, users) }
+    }
+  end
+
+  def trim_comment(comment, users)
+    author = users[comment["author_id"]] || {}
+    {
+      id: comment["id"],
+      author: { id: comment["author_id"], name: author["name"], email: author["email"] },
+      created_at: comment["created_at"],
+      public: comment["public"],
+      body: comment["plain_body"],
+      attachments: (comment["attachments"] || []).map do |attachment|
+        {
+          file_name: attachment["file_name"],
+          content_url: attachment["content_url"],
+          content_type: attachment["content_type"],
+          size: attachment["size"]
+        }
+      end
+    }
   end
 
   def create_ticket(args)
