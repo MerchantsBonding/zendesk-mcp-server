@@ -153,7 +153,15 @@ Search for tickets using Zendesk's search syntax.
 - `limit`: Maximum results to return (optional, default: 25)
 
 ### get_ticket
-Get detailed information about a specific ticket.
+Get detailed information about a specific ticket. Comments are not included;
+use `get_ticket_comments`.
+- `ticket_id`: The ticket ID (required)
+
+### get_ticket_comments
+Get the full comment thread on a ticket, oldest first. Internal notes are
+included and marked `public: false`. Each comment carries its author's name and
+email, the plain-text body, and attachment names and URLs. Threads longer than
+500 comments are cut off and the result says `truncated: true`.
 - `ticket_id`: The ticket ID (required)
 
 ### create_ticket

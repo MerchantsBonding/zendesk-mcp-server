@@ -268,3 +268,131 @@ class TestAutomaticAuthorization < Minitest::Test
     assert_empty server.attempts
   end
 end
+
+class TestTicketComments < Minitest::Test
+  def setup
+    @saved = ENV["ZENDESK_DOMAIN"]
+    ENV["ZENDESK_DOMAIN"] = SERVER_DOMAIN
+  end
+
+  def teardown
+    ENV["ZENDESK_DOMAIN"] = @saved
+    ENV.delete("ZENDESK_DOMAIN") if @saved.nil?
+  end
+
+  def comment(id, author_id: 10, public: true)
+    {
+      "id" => id, "author_id" => author_id, "public" => public,
+      "plain_body" => "body #{id}", "html_body" => "<p>body #{id}</p>",
+      "created_at" => "2026-10-01T12:00:00Z", "metadata" => { "system" => {} },
+      "attachments" => [
+        { "file_name" => "a.pdf", "content_url" => "https://files/a.pdf",
+          "content_type" => "application/pdf", "size" => 42, "thumbnails" => [] }
+      ]
+    }
+  end
+
+  def page(comments, users: [], next_cursor: nil)
+    body = {
+      "comments" => comments,
+      "users" => users,
+      "meta" => { "has_more" => !next_cursor.nil? },
+      "links" => { "next" => next_cursor && "https://#{SERVER_DOMAIN}/api/v2/tickets/5/comments.json?include=users&page%5Bafter%5D=#{next_cursor}&page%5Bsize%5D=100" }
+    }
+    FakeResponse.new(200, body.to_json)
+  end
+
+  def build(responses)
+    StubServer.new(oauth: FakeOAuth.new(tokens: ["token-1"]), responses: responses)
+  end
+
+  def test_comments_are_trimmed_to_what_a_reader_needs
+    server = build([page([comment(1)], users: [{ "id" => 10, "name" => "Ada", "email" => "ada@example.com", "phone" => "x" }])])
+
+    result = server.send(:get_ticket_comments, { "ticket_id" => 5 })
+    first = result[:comments].first
+
+    assert_equal 5, result[:ticket_id]
+    assert_equal 1, result[:count]
+    assert_equal false, result[:truncated]
+    assert_equal({ id: 10, name: "Ada", email: "ada@example.com" }, first[:author])
+    assert_equal "body 1", first[:body]
+    assert_equal true, first[:public]
+    assert_equal "2026-10-01T12:00:00Z", first[:created_at]
+    assert_equal [{ file_name: "a.pdf", content_url: "https://files/a.pdf", content_type: "application/pdf", size: 42 }], first[:attachments]
+    refute first.key?(:html_body)
+  end
+
+  def test_the_first_request_sideloads_users_and_asks_for_full_pages
+    server = build([page([comment(1)])])
+    server.send(:get_ticket_comments, { "ticket_id" => 5 })
+
+    assert_equal "/api/v2/tickets/5/comments.json?include=users&page[size]=100", server.attempts.first[:path]
+  end
+
+  # Internal notes are part of the story; the flag lets the reader tell them apart.
+  def test_internal_notes_are_kept_and_marked
+    server = build([page([comment(1), comment(2, public: false)])])
+
+    result = server.send(:get_ticket_comments, { "ticket_id" => 5 })
+
+    assert_equal [true, false], result[:comments].map { |c| c[:public] }
+  end
+
+  def test_every_page_is_followed_and_authors_from_any_page_are_resolved
+    server = build([
+      page([comment(1, author_id: 10)], users: [{ "id" => 10, "name" => "Ada", "email" => "a@x" }], next_cursor: "abc"),
+      page([comment(2, author_id: 11)], users: [{ "id" => 11, "name" => "Bo", "email" => "b@x" }])
+    ])
+
+    result = server.send(:get_ticket_comments, { "ticket_id" => 5 })
+
+    assert_equal [1, 2], result[:comments].map { |c| c[:id] }
+    assert_equal ["Ada", "Bo"], result[:comments].map { |c| c[:author][:name] }
+    assert_match(/page%5Bafter%5D=abc/, server.attempts[1][:path])
+  end
+
+  def test_an_unknown_author_still_reports_the_id
+    server = build([page([comment(1, author_id: 99)])])
+
+    result = server.send(:get_ticket_comments, { "ticket_id" => 5 })
+
+    assert_equal({ id: 99, name: nil, email: nil }, result[:comments].first[:author])
+  end
+
+  def test_paging_stops_at_the_cap_and_says_so
+    pages = Array.new(ZendeskMCPServer::MAX_COMMENT_PAGES) { |i| page([comment(i)], next_cursor: "c#{i}") }
+    server = build(pages)
+
+    result = server.send(:get_ticket_comments, { "ticket_id" => 5 })
+
+    assert_equal ZendeskMCPServer::MAX_COMMENT_PAGES, server.attempts.length
+    assert_equal true, result[:truncated]
+  end
+
+  def test_a_failed_page_returns_the_error
+    server = build([FakeResponse.new(404, '{"error":"RecordNotFound"}', "Not Found")])
+
+    result = server.send(:get_ticket_comments, { "ticket_id" => 5 })
+
+    assert_match(/404/, result[:error].to_s)
+  end
+
+  def test_the_tool_is_listed_and_dispatched
+    server = build([page([comment(1)])])
+    tools = server.send(:handle_tools_list, { "id" => 1 })[:result][:tools].map { |t| t[:name] }
+    response = server.send(:handle_tools_call, { "id" => 2, "params" => { "name" => "get_ticket_comments", "arguments" => { "ticket_id" => 5 } } })
+
+    assert_includes tools, "get_ticket_comments"
+    assert_equal 1, JSON.parse(response[:result][:content].first[:text])["count"]
+  end
+
+  # The single-ticket endpoint ignores a comments sideload, so asking for one
+  # only suggested comments would come back.
+  def test_get_ticket_no_longer_asks_for_comments
+    server = build([FakeResponse.new(200, '{"ticket":{"id":5}}')])
+    server.send(:get_ticket, { "ticket_id" => 5 })
+
+    assert_equal "/api/v2/tickets/5.json?include=users", server.attempts.first[:path]
+  end
+end

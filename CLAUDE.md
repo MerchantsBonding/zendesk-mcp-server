@@ -74,7 +74,7 @@ a browser.
 
 1. `handle_request` dispatches on the JSON-RPC `method` string to `handle_initialize`,
    `handle_tools_list`, `handle_tools_call`, `handle_resources_list`, `handle_resources_read`.
-2. Tool methods (`search_tickets`, `get_ticket`, `create_ticket`, `update_ticket`,
+2. Tool methods (`search_tickets`, `get_ticket`, `get_ticket_comments`, `create_ticket`, `update_ticket`,
    `list_users`) translate MCP arguments into a Zendesk endpoint and payload. They return
    plain Ruby hashes.
 3. `zendesk_request` builds the HTTPS call, attaches Basic auth, and parses the response.
