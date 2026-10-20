@@ -259,7 +259,12 @@ class ZendeskMCPServer
                 },
                 comment: {
                   type: "string",
-                  description: "Add a comment to the ticket"
+                  description: "Add a comment to the ticket. It is an internal note unless public is true."
+                },
+                public: {
+                  type: "boolean",
+                  description: "Post the comment as a public reply, which emails the requester. Default false: an internal note that only agents see. Ignored without a comment.",
+                  default: false
                 }
               },
               required: ["ticket_id"]
@@ -472,8 +477,10 @@ class ZendeskMCPServer
     update_data[:ticket][:status] = args["status"] if args["status"]
     update_data[:ticket][:priority] = args["priority"] if args["priority"]
 
+    # Zendesk makes a comment without `public` public and emails the requester,
+    # so only an explicit true does that.
     if args["comment"]
-      update_data[:ticket][:comment] = { body: args["comment"] }
+      update_data[:ticket][:comment] = { body: args["comment"], public: args["public"] == true }
     end
 
     zendesk_request("PUT", "/api/v2/tickets/#{ticket_id}.json", update_data)

@@ -51,7 +51,7 @@ class StubServer < ZendeskMCPServer
   end
 
   def perform_http(uri, request)
-    @attempts << { path: uri.request_uri, authorization: request["Authorization"] }
+    @attempts << { path: uri.request_uri, authorization: request["Authorization"], body: request.body }
     response = @responses.shift
     raise "StubServer ran out of canned responses" if response.nil?
     response
@@ -394,5 +394,58 @@ class TestTicketComments < Minitest::Test
     server.send(:get_ticket, { "ticket_id" => 5 })
 
     assert_equal "/api/v2/tickets/5.json?include=users", server.attempts.first[:path]
+  end
+end
+
+class TestUpdateTicket < Minitest::Test
+  def setup
+    @saved = ENV["ZENDESK_DOMAIN"]
+    ENV["ZENDESK_DOMAIN"] = SERVER_DOMAIN
+  end
+
+  def teardown
+    ENV["ZENDESK_DOMAIN"] = @saved
+    ENV.delete("ZENDESK_DOMAIN") if @saved.nil?
+  end
+
+  def sent_ticket(args)
+    server = StubServer.new(
+      oauth: FakeOAuth.new(tokens: ["token-1"]),
+      responses: [FakeResponse.new(200, '{"ticket":{"id":5}}')]
+    )
+    server.send(:update_ticket, { "ticket_id" => 5 }.merge(args))
+    JSON.parse(server.attempts.first[:body])["ticket"]
+  end
+
+  # Zendesk treats a comment without `public` as public and emails the
+  # requester, so the default has to be stated.
+  def test_a_comment_is_an_internal_note_by_default
+    assert_equal({ "body" => "found it", "public" => false }, sent_ticket("comment" => "found it")["comment"])
+  end
+
+  def test_a_public_reply_must_be_asked_for
+    assert_equal true, sent_ticket("comment" => "fixed", "public" => true)["comment"]["public"]
+  end
+
+  # A wrong guess must fail toward no email.
+  def test_only_a_true_boolean_makes_a_reply_public
+    assert_equal false, sent_ticket("comment" => "x", "public" => "true")["comment"]["public"]
+  end
+
+  def test_an_update_without_a_comment_sends_no_comment
+    ticket = sent_ticket("status" => "pending", "public" => true)
+
+    assert_equal "pending", ticket["status"]
+    refute ticket.key?("comment")
+  end
+
+  def test_the_schema_offers_an_optional_public_flag
+    server = StubServer.new(oauth: FakeOAuth.new, responses: [])
+    tools = server.send(:handle_tools_list, { "id" => 1 })[:result][:tools]
+    schema = tools.find { |t| t[:name] == "update_ticket" }[:inputSchema]
+
+    assert_equal "boolean", schema[:properties][:public][:type]
+    assert_match(/internal note/i, schema[:properties][:public][:description])
+    refute_includes schema[:required], "public"
   end
 end
